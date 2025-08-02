@@ -1,7 +1,6 @@
 // server.js - Real scores for Roblox Sports HQ
 
 const express = require("express");
-const fetch = require("node-fetch"); // make sure this is installed
 const app = express();
 const PORT = process.env.PORT || 3000;
 
