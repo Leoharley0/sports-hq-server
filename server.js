@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Replace with your TheSportsDB API key
-const API_KEY = 342128; 
+const API_KEY = "342128"; 
 
 app.get("/scores", async (req, res) => {
     try {
