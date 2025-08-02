@@ -1,4 +1,4 @@
-// server.js - Sports HQ using TheSportsDB V2 API
+// server.js - Sports HQ using TheSportsDB V2 API with header key
 
 const express = require("express");
 const app = express();
@@ -8,8 +8,12 @@ const API_KEY = "342128"; // your premium API key
 
 app.get("/scores", async (req, res) => {
     try {
-        // Fetch live soccer scores using V2 API
-        const response = await fetch(`https://www.thesportsdb.com/api/v2/json/${API_KEY}/livescore/soccer`);
+        const response = await fetch("https://www.thesportsdb.com/api/v2/json/livescore/soccer", {
+            headers: {
+                "apikey": API_KEY
+            }
+        });
+
         const data = await response.json();
 
         if (data && data.livescore && data.livescore.length > 0) {
