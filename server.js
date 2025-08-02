@@ -7,43 +7,55 @@ const API_KEY = "342128"; // your premium key
 async function fetchJson(url) {
     try {
         const response = await fetch(url, {
-            headers: { "apikey": API_KEY }
+            headers: {
+                "apikey": API_KEY
+            }
         });
-        return await response.json();
+
+        const text = await response.text();
+
+        try {
+            return JSON.parse(text);
+        } catch (err) {
+            console.error("Non-JSON response:", text.slice(0, 200));
+            return null;
+        }
     } catch (err) {
         console.error("Fetch error:", err);
         return null;
     }
 }
 
-// Generic function for a league
 async function getLeagueScores(leagueId, sport = null) {
     let data = null;
 
-    // 1. Try live (only if sport is provided, since v2 uses sport names)
+    // 1. Try live (v2)
     if (sport) {
         data = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
         if (data && data.livescore && data.livescore.length > 0) {
+            console.log("Got live data!");
             return data.livescore[0];
         }
     }
 
-    // 2. Fallback: past games
+    // 2. Past games (v1)
     data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventspastleague.php?id=${leagueId}`);
     if (data && data.events && data.events.length > 0) {
+        console.log("Got past results!");
         return data.events[0];
     }
 
-    // 3. Fallback: upcoming games
+    // 3. Upcoming games (v1)
     data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventsnextleague.php?id=${leagueId}`);
     if (data && data.events && data.events.length > 0) {
+        console.log("Got upcoming schedule!");
         return data.events[0];
     }
 
     return null;
 }
 
-// Routes for each sport
+// Routes
 app.get("/scores/soccer", async (req, res) => {
     const match = await getLeagueScores(4328, "soccer"); // EPL
     if (match) {
@@ -60,7 +72,7 @@ app.get("/scores/soccer", async (req, res) => {
 });
 
 app.get("/scores/nba", async (req, res) => {
-    const match = await getLeagueScores(4387); // NBA
+    const match = await getLeagueScores(4387);
     if (match) {
         res.json({
             team1: match.strHomeTeam,
@@ -75,7 +87,7 @@ app.get("/scores/nba", async (req, res) => {
 });
 
 app.get("/scores/nfl", async (req, res) => {
-    const match = await getLeagueScores(4391); // NFL
+    const match = await getLeagueScores(4391);
     if (match) {
         res.json({
             team1: match.strHomeTeam,
@@ -90,7 +102,7 @@ app.get("/scores/nfl", async (req, res) => {
 });
 
 app.get("/scores/nhl", async (req, res) => {
-    const match = await getLeagueScores(4380); // NHL
+    const match = await getLeagueScores(4380);
     if (match) {
         res.json({
             team1: match.strHomeTeam,
