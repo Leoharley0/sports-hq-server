@@ -7,9 +7,7 @@ const API_KEY = "342128"; // your premium key
 async function fetchJson(url) {
     try {
         const response = await fetch(url, {
-            headers: {
-                "X-API-KEY": API_KEY
-            }
+            headers: { "X-API-KEY": API_KEY }
         });
         const text = await response.text();
         try {
@@ -24,26 +22,22 @@ async function fetchJson(url) {
     }
 }
 
-async function getLeagueScores(leagueId, sport = null) {
-    let data = null;
-
-    // 1. Live scores (only for sports v2 supports)
-    if (sport) {
-        data = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
-        if (data && data.livescore && data.livescore.length > 0) {
-            console.log(`Got live ${sport} data!`);
-            return data.livescore[0];
-        }
+async function getSportScores(sport, leagueId) {
+    // 1. Try live scores (v2)
+    let data = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
+    if (data && data.livescore && data.livescore.length > 0) {
+        console.log(`Got live ${sport} data!`);
+        return data.livescore[0];
     }
 
-    // 2. Past games
+    // 2. Past games (v1)
     data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventspastleague.php?id=${leagueId}`);
     if (data && data.events && data.events.length > 0) {
         console.log(`Got past ${leagueId} results!`);
         return data.events[0];
     }
 
-    // 3. Upcoming games
+    // 3. Upcoming games (v1)
     data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventsnextleague.php?id=${leagueId}`);
     if (data && data.events && data.events.length > 0) {
         console.log(`Got upcoming ${leagueId} schedule!`);
@@ -55,7 +49,7 @@ async function getLeagueScores(leagueId, sport = null) {
 
 // Soccer (EPL)
 app.get("/scores/soccer", async (req, res) => {
-    const match = await getLeagueScores(4328, "soccer");
+    const match = await getSportScores("soccer", 4328);
     if (match) {
         res.json({
             team1: match.strHomeTeam,
@@ -69,9 +63,9 @@ app.get("/scores/soccer", async (req, res) => {
     }
 });
 
-// NBA
+// NBA (Basketball)
 app.get("/scores/nba", async (req, res) => {
-    const match = await getLeagueScores(4387);
+    const match = await getSportScores("basketball", 4387);
     if (match) {
         res.json({
             team1: match.strHomeTeam,
@@ -85,9 +79,9 @@ app.get("/scores/nba", async (req, res) => {
     }
 });
 
-// NFL
+// NFL (American Football)
 app.get("/scores/nfl", async (req, res) => {
-    const match = await getLeagueScores(4391);
+    const match = await getSportScores("american_football", 4391);
     if (match) {
         res.json({
             team1: match.strHomeTeam,
@@ -101,9 +95,9 @@ app.get("/scores/nfl", async (req, res) => {
     }
 });
 
-// NHL
+// NHL (Ice Hockey)
 app.get("/scores/nhl", async (req, res) => {
-    const match = await getLeagueScores(4380);
+    const match = await getSportScores("ice_hockey", 4380);
     if (match) {
         res.json({
             team1: match.strHomeTeam,
@@ -117,13 +111,15 @@ app.get("/scores/nhl", async (req, res) => {
     }
 });
 
-// Debug: raw API output
+// Debug route
 app.get("/scores/debug", async (req, res) => {
+    const target = req.query.url || "https://www.thesportsdb.com/api/v2/json/livescore/soccer";
     try {
-        const response = await fetch("https://www.thesportsdb.com/api/v2/json/livescore/soccer", {
+        const response = await fetch(target, {
             headers: { "X-API-KEY": API_KEY }
         });
         const text = await response.text();
+        res.setHeader("Content-Type", "text/plain");
         res.send(text);
     } catch (err) {
         res.send("Error fetching debug data: " + err);
