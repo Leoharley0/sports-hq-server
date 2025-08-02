@@ -23,92 +23,84 @@ async function fetchJson(url) {
 }
 
 async function getSportScores(sport, leagueId) {
+    let data = null;
+
     // 1. Try live scores (v2)
-    let data = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
-    if (data && data.livescore && data.livescore.length > 0) {
-        console.log(`Got live ${sport} data!`);
-        return data.livescore[0];
+    if (sport) {
+        data = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
+        if (data && data.livescore && data.livescore.length > 0) {
+            console.log(`Got live ${sport} data!`);
+            const match = data.livescore[0];
+            return {
+                ...match,
+                isLive: true
+            };
+        }
     }
 
     // 2. Past games (v1)
     data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventspastleague.php?id=${leagueId}`);
     if (data && data.events && data.events.length > 0) {
         console.log(`Got past ${leagueId} results!`);
-        return data.events[0];
+        const match = data.events[0];
+        return {
+            ...match,
+            isLive: false
+        };
     }
 
     // 3. Upcoming games (v1)
     data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventsnextleague.php?id=${leagueId}`);
     if (data && data.events && data.events.length > 0) {
         console.log(`Got upcoming ${leagueId} schedule!`);
-        return data.events[0];
+        const match = data.events[0];
+        return {
+            ...match,
+            isLive: false
+        };
     }
 
     return null;
 }
 
-// Soccer (EPL)
+function formatMatchResponse(match) {
+    if (!match) return { headline: "No data available." };
+
+    const headline = match.isLive
+        ? `${match.strHomeTeam} vs ${match.strAwayTeam} - LIVE`
+        : `${match.strHomeTeam} vs ${match.strAwayTeam} on ${match.dateEvent || "TBD"}`;
+
+    return {
+        team1: match.strHomeTeam,
+        score1: match.intHomeScore || "N/A",
+        team2: match.strAwayTeam,
+        score2: match.intAwayScore || "N/A",
+        headline: headline
+    };
+}
+
+// Soccer
 app.get("/scores/soccer", async (req, res) => {
     const match = await getSportScores("soccer", 4328);
-    if (match) {
-        res.json({
-            team1: match.strHomeTeam,
-            score1: match.intHomeScore || "N/A",
-            team2: match.strAwayTeam,
-            score2: match.intAwayScore || "N/A",
-            headline: `${match.strHomeTeam} vs ${match.strAwayTeam}`
-        });
-    } else {
-        res.json({ headline: "No soccer data available." });
-    }
+    res.json(formatMatchResponse(match));
 });
 
 // NBA (Basketball)
 app.get("/scores/nba", async (req, res) => {
     const match = await getSportScores("basketball", 4387);
-    if (match) {
-        res.json({
-            team1: match.strHomeTeam,
-            score1: match.intHomeScore || "N/A",
-            team2: match.strAwayTeam,
-            score2: match.intAwayScore || "N/A",
-            headline: `${match.strHomeTeam} vs ${match.strAwayTeam}`
-        });
-    } else {
-        res.json({ headline: "No NBA data available." });
-    }
+    res.json(formatMatchResponse(match));
 });
 
 // NFL (American Football)
 app.get("/scores/nfl", async (req, res) => {
     const match = await getSportScores("american_football", 4391);
-    if (match) {
-        res.json({
-            team1: match.strHomeTeam,
-            score1: match.intHomeScore || "N/A",
-            team2: match.strAwayTeam,
-            score2: match.intAwayScore || "N/A",
-            headline: `${match.strHomeTeam} vs ${match.strAwayTeam}`
-        });
-    } else {
-        res.json({ headline: "No NFL data available." });
-    }
+    res.json(formatMatchResponse(match));
 });
 
-// NHL (Ice Hockey)
+// NHL (Hockey)
 app.get("/scores/nhl", async (req, res) => {
-    const match = await getSportScores("ice_hockey", 4380);
-    if (match) {
-        res.json({
-            team1: match.strHomeTeam,
-            score1: match.intHomeScore || "N/A",
-            team2: match.strAwayTeam,
-            score2: match.intAwayScore || "N/A",
-            headline: `${match.strHomeTeam} vs ${match.strAwayTeam}`
-        });
-    } else {
-        res.json({ headline: "No NHL data available." });
-    }
+    const match = await getSportScores("hockey", 4380);
+    res.json(formatMatchResponse(match));
 });
 
 // Debug route
