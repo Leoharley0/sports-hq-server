@@ -6,9 +6,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Replace with your TheSportsDB API key
-const API_KEY = "123"; 
+const API_KEY = 342128; 
 
-// Endpoint Roblox will call
 app.get("/scores", async (req, res) => {
     try {
         // Fetch live basketball games
@@ -16,7 +15,7 @@ app.get("/scores", async (req, res) => {
         const data = await response.json();
 
         if (data && data.events && data.events.length > 0) {
-            const match = data.events[0]; // just take the first live game
+            const match = data.events[0]; // show first live match
             res.json({
                 team1: match.strHomeTeam,
                 score1: match.intHomeScore,
@@ -28,12 +27,11 @@ app.get("/scores", async (req, res) => {
             res.json({ headline: "No live basketball games right now." });
         }
     } catch (error) {
-        console.error(error);
+        console.error("API fetch error:", error);
         res.json({ headline: "Error fetching scores." });
     }
 });
 
-// Start the server
 app.listen(PORT, () => {
     console.log(`Sports HQ server running on http://localhost:${PORT}`);
 });
