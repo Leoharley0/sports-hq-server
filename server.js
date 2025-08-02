@@ -1,29 +1,37 @@
-// server.js - Test server for Roblox Sports HQ
-// This sends fake live scores to your Roblox game
+// server.js - Real scores for Roblox Sports HQ
 
 const express = require("express");
+const fetch = require("node-fetch"); // make sure this is installed
 const app = express();
-const PORT = 3000; // server runs on localhost:3000
+const PORT = process.env.PORT || 3000;
 
-// Example sports data (later, you can connect to a real API)
-let scores = {
-    team1: "Lakers",
-    score1: 102,
-    team2: "Heat",
-    score2: 98,
-    headline: "Lakers take the lead in the final quarter!"
-};
+// Replace with your TheSportsDB API key
+const API_KEY = "123"; 
 
-// Endpoint Roblox will call to get scores
-app.get("/scores", (req, res) => {
-    res.json(scores);
+// Endpoint Roblox will call
+app.get("/scores", async (req, res) => {
+    try {
+        // Fetch live basketball games
+        const response = await fetch(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/livescore.php?s=Basketball`);
+        const data = await response.json();
+
+        if (data && data.events && data.events.length > 0) {
+            const match = data.events[0]; // just take the first live game
+            res.json({
+                team1: match.strHomeTeam,
+                score1: match.intHomeScore,
+                team2: match.strAwayTeam,
+                score2: match.intAwayScore,
+                headline: `${match.strHomeTeam} vs ${match.strAwayTeam} is live!`
+            });
+        } else {
+            res.json({ headline: "No live basketball games right now." });
+        }
+    } catch (error) {
+        console.error(error);
+        res.json({ headline: "Error fetching scores." });
+    }
 });
-
-// Update the scores slightly every 20 seconds to simulate a live game
-setInterval(() => {
-    scores.score1 += Math.floor(Math.random() * 3); // add 0–2 points
-    scores.score2 += Math.floor(Math.random() * 3);
-}, 20000);
 
 // Start the server
 app.listen(PORT, () => {
