@@ -3,35 +3,38 @@ const fetch = require("node-fetch");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const API_KEY = "342128"; // your TheSportsDB key
+const API_KEY = "342128"; // your TheSportsDB v2 key
 
-// 1. Major‐league whitelist for TheSportsDB live
+// 1. Whitelist of major leagues for live TSDB
 const MAJOR = {
-  soccer:            ["English Premier League","La Liga","UEFA Champions League"],
+  soccer:            ["English Premier League", "La Liga", "UEFA Champions League"],
   basketball:        ["NBA"],
   american_football: ["NFL"],
   ice_hockey:        ["NHL"]
 };
 
-// 2. Fallback default league names for ESPN
-const DEFAULT_LEAGUE = {
-  soccer:            "Soccer",
-  basketball:        "NBA",
-  american_football: "NFL",
-  ice_hockey:        "NHL"
-};
-
-// 3. Map sport → ESPN path
+// 2. Map our sport codes to ESPN scoreboard paths
 function getEspnPath(sport) {
   switch (sport) {
     case "soccer":            return "soccer/eng.1";
     case "basketball":        return "basketball/nba";
     case "american_football": return "football/nfl";
     case "ice_hockey":        return "hockey/nhl";
+    default:                   return sport;
   }
 }
 
-// 4. Smart JSON fetch
+// 3. Helper to format YYYYMMDD for ESPN dates
+function formatDateOffset(offsetDays) {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  const YYYY = d.getFullYear();
+  const MM = String(d.getMonth() + 1).padStart(2, "0");
+  const DD = String(d.getDate()).padStart(2, "0");
+  return `${YYYY}${MM}${DD}`;
+}
+
+// 4. Smart fetch: only add TSDB header on v2 calls
 async function fetchJson(url, opts = {}) {
   try {
     const res = await fetch(url, opts);
@@ -47,13 +50,13 @@ async function fetchJson(url, opts = {}) {
   }
 }
 
-// 5. Format TSDB match
+// 5. Normalize a TSDB live match
 function formatTSDB(m) {
   let status = "Scheduled";
-  const s = (m.strStatus||"").toLowerCase();
-  if (s.includes("live")) status = "LIVE";
-  else if (/finished|ended|ft/.test(s)) status = "Final";
-  else if (m.dateEvent) status = `on ${m.dateEvent}`;
+  const s = (m.strStatus || "").toLowerCase();
+  if (s.includes("live"))                   status = "LIVE";
+  else if (/finished|ended|ft/.test(s))     status = "Final";
+  else if (m.dateEvent)                     status = `on ${m.dateEvent}`;
 
   return {
     id:       m.idEvent,
@@ -66,92 +69,63 @@ function formatTSDB(m) {
   };
 }
 
-// 6. Format ESPN match
-function formatESPN(e, sport) {
+// 6. Normalize an ESPN upcoming match
+function formatESPN(e) {
   const comp = e.competitions?.[0];
-  const home = comp?.competitors.find(c=>c.homeAway==="home");
-  const away = comp?.competitors.find(c=>c.homeAway==="away");
+  if (!comp) return null;
+  const home = comp.competitors.find(c => c.homeAway === "home");
+  const away = comp.competitors.find(c => c.homeAway === "away");
   if (!home || !away) return null;
 
-  const started   = e.status?.type?.started;
-  const completed = e.status?.type?.completed;
-  let status = "Scheduled";
-  if (started && !completed) status = "LIVE";
-  else if (completed)         status = "Final";
+  const state = e.status?.type?.state; // "PRE", "IN", "POST"
+  const status = state === "IN"   ? "LIVE"
+               : state === "POST" ? "Final"
+               :                     "Scheduled";
 
-  const leagueName = e.leagues?.[0]?.name || DEFAULT_LEAGUE[sport];
+  const leagueName = e.leagues?.[0]?.name || "";
 
   return {
     id:       e.id,
     team1:    home.team.displayName,
-    score1:   home.score || "N/A",
+    score1:   home.score     || "N/A",
     team2:    away.team.displayName,
-    score2:   away.score || "N/A",
+    score2:   away.score     || "N/A",
     league:   leagueName,
     headline: `${home.team.displayName} vs ${away.team.displayName} - ${status}`
   };
 }
 
-// 7. YYYYMMDD helper
-function formatDateOffset(offset) {
-  const d = new Date();
-  d.setDate(d.getDate() + offset);
-  const Y = d.getFullYear();
-  const M = String(d.getMonth()+1).padStart(2,"0");
-  const D = String(d.getDate()).padStart(2,"0");
-  return `${Y}${M}${D}`;
-}
-
-// 8. Core getMatches
+// 7. Core logic: live → upcoming-only, cap at 5
 async function getMatches(sport) {
   const results = [];
   const seen    = new Set();
   const majors  = MAJOR[sport] || [];
 
-  // 1️⃣ TSDB live
+  // 7.1 Live from TheSportsDB v2
   const tsdb = await fetchJson(
     `https://www.thesportsdb.com/api/v2/json/livescore/${sport}`,
-    { headers:{ "X-API-KEY":API_KEY } }
+    { headers: { "X-API-KEY": API_KEY } }
   );
-  for (const m of tsdb?.livescore||[]) {
-    if (results.length>=5) break;
+  for (const m of tsdb?.livescore || []) {
+    if (results.length >= 5) break;
     if (!majors.includes(m.strLeague)) continue;
     const fm = formatTSDB(m);
     results.push(fm);
     seen.add(fm.id);
   }
 
-  // 2️⃣ ESPN upcoming (today + next 2 days)
-  if (results.length<5) {
-    const espnPath = getEspnPath(sport);
-    for (let d=0; d<3 && results.length<5; d++) {
+  // 7.2 ESPN upcoming (today + next 2 days)
+  if (results.length < 5) {
+    const path = getEspnPath(sport);
+    for (let d = 0; d < 3 && results.length < 5; d++) {
       const date = formatDateOffset(d);
       const espn = await fetchJson(
-        `https://site.api.espn.com/apis/site/v2/sports/${espnPath}/scoreboard?dates=${date}`
+        `https://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard?dates=${date}`
       );
-      for (const e of espn?.events||[]) {
-        if (results.length>=5) break;
+      for (const e of espn?.events || []) {
+        if (results.length >= 5) break;
         if (seen.has(e.id)) continue;
-        const fm = formatESPN(e,sport);
-        if (!fm) continue;
-        results.push(fm);
-        seen.add(e.id);
-      }
-    }
-  }
-
-  // 3️⃣ ESPN completed (yesterday + 2 days prior)
-  if (results.length<5) {
-    const espnPath = getEspnPath(sport);
-    for (let d=1; d<=3 && results.length<5; d++) {
-      const date = formatDateOffset(-d);
-      const espn = await fetchJson(
-        `https://site.api.espn.com/apis/site/v2/sports/${espnPath}/scoreboard?dates=${date}`
-      );
-      for (const e of espn?.events||[]) {
-        if (results.length>=5) break;
-        if (seen.has(e.id)) continue;
-        const fm = formatESPN(e,sport);
+        const fm = formatESPN(e);
         if (!fm) continue;
         results.push(fm);
         seen.add(e.id);
@@ -162,30 +136,52 @@ async function getMatches(sport) {
   return results;
 }
 
-// 9. Endpoints
-app.get("/scores/soccer", async(_,res)=>{
+// 8. HTTP endpoints
+app.get("/scores/soccer", async (req, res) => {
   const m = await getMatches("soccer");
-  res.json(m.length?m:[{headline:"No major soccer games right now."}]);
+  res.json(m.length
+    ? m
+    : [{ headline: "No major soccer games or upcoming slots available." }]
+  );
 });
-app.get("/scores/nba", async(_,res)=>{
+
+app.get("/scores/nba", async (req, res) => {
   const m = await getMatches("basketball");
-  res.json(m.length?m:[{headline:"No NBA games right now."}]);
+  res.json(m.length
+    ? m
+    : [{ headline: "No NBA games or upcoming slots available." }]
+  );
 });
-app.get("/scores/nfl", async(_,res)=>{
+
+app.get("/scores/nfl", async (req, res) => {
   const m = await getMatches("american_football");
-  res.json(m.length?m:[{headline:"No NFL games right now."}]);
+  res.json(m.length
+    ? m
+    : [{ headline: "No NFL games or upcoming slots available." }]
+  );
 });
-app.get("/scores/nhl", async(_,res)=>{
+
+app.get("/scores/nhl", async (req, res) => {
   const m = await getMatches("ice_hockey");
-  res.json(m.length?m:[{headline:"No NHL games right now."}]);
+  res.json(m.length
+    ? m
+    : [{ headline: "No NHL games or upcoming slots available." }]
+  );
 });
 
-// 10. Debug
-app.get("/scores/debug", async(req,res)=>{
-  const url=req.query.url;
-  if(!url) return res.status(400).send("Provide ?url=");
-  try{ const t=await (await fetch(url)).text(); res.type("text/plain").send(t); }
-  catch(e){ res.send("Error: "+e); }
+// 9. Debug route for any URL
+app.get("/scores/debug", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).send("Provide ?url=");
+  try {
+    const text = await (await fetch(url)).text();
+    res.type("text/plain").send(text);
+  } catch (e) {
+    res.send("Error: " + e);
+  }
 });
 
-app.listen(PORT,()=>console.log(`Listening on port ${PORT}`));
+// 10. Start server
+app.listen(PORT, () => {
+  console.log(`Sports HQ server running on port ${PORT}`);
+});
