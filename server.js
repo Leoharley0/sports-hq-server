@@ -40,20 +40,26 @@ const POPULAR_SOCCER_LEAGUES = [
 async function getPopularSoccerMatches() {
     let matches = [];
 
-    // Live soccer
+    // 1. Live soccer
     let data = await fetchJson("https://www.thesportsdb.com/api/v2/json/livescore/soccer");
     if (data && data.livescore) {
         matches.push(...data.livescore);
     }
 
-    // Past EPL as fallback
-    data = await fetchJson("https://www.thesportsdb.com/api/v1/json/eventspastleague.php?id=4328"); // EPL
-    if (data && data.events) {
-        matches.push(...data.events);
+    // 2. Past/Upcoming from multiple big leagues
+    const leagueIds = [4328, 4335, 4332, 4331, 4334, 4480, 4481, 4673, 4674, 4482];
+    for (let id of leagueIds) {
+        let past = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventspastleague.php?id=${id}`);
+        if (past && past.events) matches.push(...past.events);
+
+        let next = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventsnextleague.php?id=${id}`);
+        if (next && next.events) matches.push(...next.events);
     }
 
     // Filter to only popular leagues
-    matches = matches.filter(m => POPULAR_SOCCER_LEAGUES.includes(m.strLeague));
+    matches = matches.filter(m =>
+        POPULAR_SOCCER_LEAGUES.includes(m.strLeague) && m.strLeague !== "Test League"
+    );
 
     // Deduplicate
     const seen = new Set();
