@@ -22,6 +22,7 @@ async function fetchJson(url) {
     }
 }
 
+// Major leagues whitelist
 const MAJOR_LEAGUES = {
     soccer: [
         "English Premier League",
@@ -37,6 +38,14 @@ const MAJOR_LEAGUES = {
     ice_hockey: ["NHL"]
 };
 
+// Map sports to league IDs for upcoming/past
+const LEAGUE_IDS = {
+    soccer: 4328,             // EPL
+    basketball: 4387,         // NBA
+    american_football: 4391,  // NFL
+    ice_hockey: 4380          // NHL
+};
+
 function formatMatch(m) {
     let status = "Scheduled";
     if (m.strStatus) {
@@ -48,7 +57,6 @@ function formatMatch(m) {
         if (m.intHomeScore && m.intAwayScore) status = "Final";
         else if (m.dateEvent) status = `on ${m.dateEvent}`;
     }
-
     return {
         team1: m.strHomeTeam,
         score1: m.intHomeScore || "N/A",
@@ -59,28 +67,27 @@ function formatMatch(m) {
     };
 }
 
-async function getMatches(sport, leagueId) {
+async function getMatches(sport) {
+    const leagueId = LEAGUE_IDS[sport];
     let matches = [];
 
     // 1. Live (v2)
     let live = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
-    if (live?.livescore) {
-        matches.push(...live.livescore);
-    }
+    if (live?.livescore) matches.push(...live.livescore);
 
-    if (matches.length < 5) {
-        // 2. Upcoming (v1)
+    // 2. Upcoming (v1)
+    if (matches.length < 5 && leagueId) {
         let upcoming = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventsnextleague.php?id=${leagueId}`);
         if (upcoming?.events) matches.push(...upcoming.events);
     }
 
-    if (matches.length < 5) {
-        // 3. Completed (v1)
+    // 3. Completed (v1)
+    if (matches.length < 5 && leagueId) {
         let past = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventspastleague.php?id=${leagueId}`);
         if (past?.events) matches.push(...past.events);
     }
 
-    // Filter to only major leagues
+    // Filter to major leagues
     const majors = MAJOR_LEAGUES[sport] || [];
     matches = matches.filter(m => majors.includes(m.strLeague));
 
@@ -92,34 +99,32 @@ async function getMatches(sport, leagueId) {
         return true;
     });
 
+    // Cap at 5
     return matches.slice(0, 5).map(formatMatch);
 }
 
-// Soccer
+// Endpoints
 app.get("/scores/soccer", async (req, res) => {
-    const matches = await getMatches("soccer", 4328);
+    const matches = await getMatches("soccer");
     res.json(matches.length ? matches : [{ headline: "No major soccer games available." }]);
 });
 
-// NBA
 app.get("/scores/nba", async (req, res) => {
-    const matches = await getMatches("basketball", 4387);
+    const matches = await getMatches("basketball");
     res.json(matches.length ? matches : [{ headline: "No NBA games available." }]);
 });
 
-// NFL
 app.get("/scores/nfl", async (req, res) => {
-    const matches = await getMatches("american_football", 4391);
+    const matches = await getMatches("american_football");
     res.json(matches.length ? matches : [{ headline: "No NFL games available." }]);
 });
 
-// NHL
 app.get("/scores/nhl", async (req, res) => {
-    const matches = await getMatches("ice_hockey", 4380);
+    const matches = await getMatches("ice_hockey");
     res.json(matches.length ? matches : [{ headline: "No NHL games available." }]);
 });
 
-// Debug
+// Debug route
 app.get("/scores/debug", async (req, res) => {
     const url = req.query.url || "https://www.thesportsdb.com/api/v2/json/livescore/soccer";
     try {
