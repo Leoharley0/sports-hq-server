@@ -22,61 +22,71 @@ async function fetchJson(url) {
     }
 }
 
-async function getSportScores(sport, leagueId) {
-    let data = null;
+// Popular soccer leagues
+const POPULAR_SOCCER_LEAGUES = [
+    "English Premier League",
+    "La Liga",
+    "Serie A",
+    "Bundesliga",
+    "Ligue 1",
+    "UEFA Champions League",
+    "UEFA Europa League",
+    "FIFA World Cup",
+    "UEFA Euro Championship",
+    "Copa America"
+];
 
-    // 1. Try live scores (v2)
-    if (sport) {
-        data = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
-        if (data && data.livescore && data.livescore.length > 0) {
-            console.log(`Got ${sport} livescore data`);
-            const match = data.livescore[0];
+// Fetch soccer matches with popularity filter
+async function getPopularSoccerMatches() {
+    let matches = [];
 
-            // Mark live only if strStatus says so
-            match.isLive = match.strStatus && match.strStatus.toLowerCase().includes("live");
-            return match;
-        }
+    // Live soccer
+    let data = await fetchJson("https://www.thesportsdb.com/api/v2/json/livescore/soccer");
+    if (data && data.livescore) {
+        matches.push(...data.livescore);
     }
 
-    // 2. Past games (v1)
-    data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventspastleague.php?id=${leagueId}`);
-    if (data && data.events && data.events.length > 0) {
-        console.log(`Got past ${leagueId} results`);
-        const match = data.events[0];
-        match.isLive = false;
-        return match;
+    // Past EPL as fallback
+    data = await fetchJson("https://www.thesportsdb.com/api/v1/json/eventspastleague.php?id=4328"); // EPL
+    if (data && data.events) {
+        matches.push(...data.events);
     }
 
-    // 3. Upcoming games (v1)
-    data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventsnextleague.php?id=${leagueId}`);
-    if (data && data.events && data.events.length > 0) {
-        console.log(`Got upcoming ${leagueId} schedule`);
-        const match = data.events[0];
-        match.isLive = false;
-        return match;
-    }
+    // Filter to only popular leagues
+    matches = matches.filter(m => POPULAR_SOCCER_LEAGUES.includes(m.strLeague));
 
-    return null;
+    // Deduplicate
+    const seen = new Set();
+    matches = matches.filter(m => {
+        if (seen.has(m.idEvent)) return false;
+        seen.add(m.idEvent);
+        return true;
+    });
+
+    // Sort: live > final > scheduled
+    matches.sort((a, b) => {
+        const score = (m) => {
+            if (m.strStatus && m.strStatus.toLowerCase().includes("live")) return 2;
+            if (m.intHomeScore && m.intAwayScore) return 1;
+            return 0;
+        };
+        return score(b) - score(a);
+    });
+
+    return matches.slice(0, 5); // limit to 5 matches
 }
 
-function formatMatchResponse(match) {
-    if (!match) return { headline: "No data available." };
-
+function formatMatch(match) {
     let statusText = "Scheduled";
 
     if (match.strStatus) {
         const status = match.strStatus.toLowerCase();
-        if (status.includes("live") || status.includes("playing")) {
-            statusText = "LIVE";
-        } else if (status.includes("finished") || status.includes("ended") || status.includes("ft")) {
-            statusText = "Final";
-        } else {
-            statusText = match.dateEvent ? `on ${match.dateEvent}` : "Scheduled";
-        }
+        if (status.includes("live")) statusText = "LIVE";
+        else if (status.includes("finished") || status.includes("ended") || status.includes("ft")) statusText = "Final";
+        else statusText = match.dateEvent ? `on ${match.dateEvent}` : "Scheduled";
     } else {
-        // Fallback if no strStatus given
         if (match.intHomeScore && match.intAwayScore) {
-            statusText = "Final"; // if scores exist but no strStatus, assume game completed
+            statusText = "Final";
         } else {
             statusText = match.dateEvent ? `on ${match.dateEvent}` : "Scheduled";
         }
@@ -87,32 +97,36 @@ function formatMatchResponse(match) {
         score1: match.intHomeScore || "N/A",
         team2: match.strAwayTeam,
         score2: match.intAwayScore || "N/A",
+        league: match.strLeague,
         headline: `${match.strHomeTeam} vs ${match.strAwayTeam} - ${statusText}`
     };
 }
 
-// Soccer (EPL)
+// Soccer endpoint
 app.get("/scores/soccer", async (req, res) => {
-    const match = await getSportScores("soccer", 4328);
-    res.json(formatMatchResponse(match));
+    const matches = await getPopularSoccerMatches();
+    if (matches.length === 0) {
+        return res.json([{ headline: "No major soccer games available." }]);
+    }
+    res.json(matches.map(formatMatch));
 });
 
-// NBA (Basketball)
+// NBA
 app.get("/scores/nba", async (req, res) => {
     const match = await getSportScores("basketball", 4387);
-    res.json(formatMatchResponse(match));
+    res.json(match ? formatMatch(match) : { headline: "No NBA data available." });
 });
 
-// NFL (American Football)
+// NFL
 app.get("/scores/nfl", async (req, res) => {
     const match = await getSportScores("american_football", 4391);
-    res.json(formatMatchResponse(match));
+    res.json(match ? formatMatch(match) : { headline: "No NFL data available." });
 });
 
-// NHL (Hockey)
+// NHL
 app.get("/scores/nhl", async (req, res) => {
     const match = await getSportScores("hockey", 4380);
-    res.json(formatMatchResponse(match));
+    res.json(match ? formatMatch(match) : { headline: "No NHL data available." });
 });
 
 // Debug route
@@ -133,3 +147,33 @@ app.get("/scores/debug", async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Sports HQ server running on http://localhost:${PORT}`);
 });
+
+// Reuse getSportScores from before
+async function getSportScores(sport, leagueId) {
+    let data = null;
+
+    if (sport) {
+        data = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
+        if (data && data.livescore && data.livescore.length > 0) {
+            const match = data.livescore[0];
+            match.isLive = match.strStatus && match.strStatus.toLowerCase().includes("live");
+            return match;
+        }
+    }
+
+    data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventspastleague.php?id=${leagueId}`);
+    if (data && data.events && data.events.length > 0) {
+        const match = data.events[0];
+        match.isLive = false;
+        return match;
+    }
+
+    data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventsnextleague.php?id=${leagueId}`);
+    if (data && data.events && data.events.length > 0) {
+        const match = data.events[0];
+        match.isLive = false;
+        return match;
+    }
+
+    return null;
+}
