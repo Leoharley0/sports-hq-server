@@ -74,9 +74,22 @@ function formatMatchResponse(match) {
             statusText = match.dateEvent ? `on ${match.dateEvent}` : "Scheduled";
         }
     } else {
-        statusText = match.isLive ? "LIVE" : (match.dateEvent ? `on ${match.dateEvent}` : "Scheduled");
+        // Fallback if no strStatus given
+        if (match.intHomeScore && match.intAwayScore) {
+            statusText = "Final"; // if scores exist but no strStatus, assume game completed
+        } else {
+            statusText = match.dateEvent ? `on ${match.dateEvent}` : "Scheduled";
+        }
     }
 
+    return {
+        team1: match.strHomeTeam,
+        score1: match.intHomeScore || "N/A",
+        team2: match.strAwayTeam,
+        score2: match.intAwayScore || "N/A",
+        headline: `${match.strHomeTeam} vs ${match.strAwayTeam} - ${statusText}`
+    };
+}
     return {
         team1: match.strHomeTeam,
         score1: match.intHomeScore || "N/A",
