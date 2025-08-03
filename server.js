@@ -6,7 +6,10 @@ const API_KEY = "342128"; // your premium key
 
 async function fetchJson(url) {
     try {
-        const res = await fetch(url, { headers: { "X-API-KEY": API_KEY } });
+        const opts = url.includes("/v2/")
+            ? { headers: { "X-API-KEY": API_KEY } }
+            : {};
+        const res = await fetch(url, opts);
         const txt = await res.text();
         if (txt.trim().startsWith("<!DOCTYPE") || txt.trim().startsWith("<html")) {
             console.error("HTML error from", url);
@@ -19,7 +22,6 @@ async function fetchJson(url) {
     }
 }
 
-// Whitelisted big leagues
 const MAJOR_LEAGUES = {
     soccer: [
         "English Premier League",
@@ -37,7 +39,6 @@ const MAJOR_LEAGUES = {
 
 function formatMatch(m) {
     let status = "Scheduled";
-
     if (m.strStatus) {
         const s = m.strStatus.toLowerCase();
         if (s.includes("live")) status = "LIVE";
@@ -58,40 +59,64 @@ function formatMatch(m) {
     };
 }
 
-async function getLiveMatches(sport) {
-    const data = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
-    if (!data || !data.livescore) return [];
+async function getMatches(sport, leagueId) {
+    let matches = [];
+
+    // 1. Live (v2)
+    let live = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
+    if (live?.livescore) {
+        matches.push(...live.livescore);
+    }
+
+    if (matches.length < 5) {
+        // 2. Upcoming (v1)
+        let upcoming = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventsnextleague.php?id=${leagueId}`);
+        if (upcoming?.events) matches.push(...upcoming.events);
+    }
+
+    if (matches.length < 5) {
+        // 3. Completed (v1)
+        let past = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventspastleague.php?id=${leagueId}`);
+        if (past?.events) matches.push(...past.events);
+    }
 
     // Filter to only major leagues
-    const majorLeagues = MAJOR_LEAGUES[sport] || [];
-    return data.livescore
-        .filter(m => majorLeagues.includes(m.strLeague))
-        .map(formatMatch)
-        .slice(0, 5);
+    const majors = MAJOR_LEAGUES[sport] || [];
+    matches = matches.filter(m => majors.includes(m.strLeague));
+
+    // Deduplicate
+    const seen = new Set();
+    matches = matches.filter(m => {
+        if (seen.has(m.idEvent)) return false;
+        seen.add(m.idEvent);
+        return true;
+    });
+
+    return matches.slice(0, 5).map(formatMatch);
 }
 
 // Soccer
 app.get("/scores/soccer", async (req, res) => {
-    const matches = await getLiveMatches("soccer");
-    res.json(matches.length ? matches : [{ headline: "No live major soccer games available." }]);
+    const matches = await getMatches("soccer", 4328);
+    res.json(matches.length ? matches : [{ headline: "No major soccer games available." }]);
 });
 
 // NBA
 app.get("/scores/nba", async (req, res) => {
-    const matches = await getLiveMatches("basketball");
-    res.json(matches.length ? matches : [{ headline: "No live NBA games available." }]);
+    const matches = await getMatches("basketball", 4387);
+    res.json(matches.length ? matches : [{ headline: "No NBA games available." }]);
 });
 
 // NFL
 app.get("/scores/nfl", async (req, res) => {
-    const matches = await getLiveMatches("american_football");
-    res.json(matches.length ? matches : [{ headline: "No live NFL games available." }]);
+    const matches = await getMatches("american_football", 4391);
+    res.json(matches.length ? matches : [{ headline: "No NFL games available." }]);
 });
 
-// NHL (try ice_hockey)
+// NHL
 app.get("/scores/nhl", async (req, res) => {
-    const matches = await getLiveMatches("ice_hockey");
-    res.json(matches.length ? matches : [{ headline: "No live NHL games available." }]);
+    const matches = await getMatches("ice_hockey", 4380);
+    res.json(matches.length ? matches : [{ headline: "No NHL games available." }]);
 });
 
 // Debug
