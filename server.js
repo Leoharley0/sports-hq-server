@@ -90,14 +90,6 @@ function formatMatchResponse(match) {
         headline: `${match.strHomeTeam} vs ${match.strAwayTeam} - ${statusText}`
     };
 }
-    return {
-        team1: match.strHomeTeam,
-        score1: match.intHomeScore || "N/A",
-        team2: match.strAwayTeam,
-        score2: match.intAwayScore || "N/A",
-        headline: `${match.strHomeTeam} vs ${match.strAwayTeam} - ${statusText}`
-    };
-}
 
 // Soccer (EPL)
 app.get("/scores/soccer", async (req, res) => {
