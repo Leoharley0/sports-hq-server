@@ -34,17 +34,21 @@ const POPULAR_SOCCER_LEAGUES = [
     "UEFA Champions League"
 ];
 
-async function getPopularSoccerMatches() {
+// In-memory cache
+let soccerCache = { data: [], timestamp: 0 };
+let otherSportsCache = { nba: null, nfl: null, nhl: null, timestamp: 0 };
+
+async function fetchSoccerMatches() {
     let matches = [];
 
-    // 1. Live soccer (v2)
+    // Live soccer (v2)
     let data = await fetchJson("https://www.thesportsdb.com/api/v2/json/livescore/soccer");
     if (data && data.livescore) {
         matches.push(...data.livescore);
     }
 
-    // 2. Past & Upcoming from top 3 leagues only (v1)
-    const leagueIds = [4328, 4335, 4480]; // EPL, La Liga, Champions League
+    // Past & Upcoming from EPL, La Liga, UCL (v1)
+    const leagueIds = [4328, 4335, 4480];
     for (let id of leagueIds) {
         let past = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventspastleague.php?id=${id}`);
         if (past && past.events) matches.push(...past.events);
@@ -76,7 +80,7 @@ async function getPopularSoccerMatches() {
         return score(b) - score(a);
     });
 
-    return matches.slice(0, 5); // top 5
+    return matches.slice(0, 5);
 }
 
 function formatMatch(match) {
@@ -105,66 +109,67 @@ function formatMatch(match) {
     };
 }
 
-// Soccer endpoint with timeout safety
+// Soccer endpoint with caching
 app.get("/scores/soccer", async (req, res) => {
-    const timeout = setTimeout(() => {
-        res.json([{ headline: "Timeout: Unable to fetch soccer data in time." }]);
-    }, 9000); // 9 seconds safety
+    const now = Date.now();
 
-    const matches = await getPopularSoccerMatches();
-    clearTimeout(timeout);
+    if (now - soccerCache.timestamp > 60000) { // refresh every 60s
+        console.log("Refreshing soccer cache...");
+        soccerCache.data = await fetchSoccerMatches();
+        soccerCache.timestamp = now;
+    }
 
-    if (matches.length === 0) {
+    if (!soccerCache.data || soccerCache.data.length === 0) {
         return res.json([{ headline: "No major soccer games available." }]);
     }
-    res.json(matches.map(formatMatch));
+
+    res.json(soccerCache.data.map(formatMatch));
 });
 
-// Generic sports function for NBA/NFL/NHL
-async function getSportScores(sport, leagueId) {
-    let data = null;
+// Generic sports function with caching
+async function getSportScoresCached(sport, leagueId, key) {
+    const now = Date.now();
 
-    if (sport) {
-        data = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
-        if (data && data.livescore && data.livescore.length > 0) {
-            const match = data.livescore[0];
-            match.isLive = match.strStatus && match.strStatus.toLowerCase().includes("live");
+    if (now - otherSportsCache.timestamp > 60000) {
+        console.log("Refreshing other sports cache...");
+        otherSportsCache.timestamp = now;
+
+        otherSportsCache[key] = await (async () => {
+            let match = null;
+            let data = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
+            if (data && data.livescore && data.livescore.length > 0) {
+                match = data.livescore[0];
+                match.isLive = match.strStatus && match.strStatus.toLowerCase().includes("live");
+            } else {
+                data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventspastleague.php?id=${leagueId}`);
+                if (data && data.events && data.events.length > 0) match = data.events[0];
+                else {
+                    data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventsnextleague.php?id=${leagueId}`);
+                    if (data && data.events && data.events.length > 0) match = data.events[0];
+                }
+            }
             return match;
-        }
+        })();
     }
 
-    data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventspastleague.php?id=${leagueId}`);
-    if (data && data.events && data.events.length > 0) {
-        const match = data.events[0];
-        match.isLive = false;
-        return match;
-    }
-
-    data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventsnextleague.php?id=${leagueId}`);
-    if (data && data.events && data.events.length > 0) {
-        const match = data.events[0];
-        match.isLive = false;
-        return match;
-    }
-
-    return null;
+    return otherSportsCache[key];
 }
 
 // NBA
 app.get("/scores/nba", async (req, res) => {
-    const match = await getSportScores("basketball", 4387);
+    const match = await getSportScoresCached("basketball", 4387, "nba");
     res.json(match ? formatMatch(match) : { headline: "No NBA data available." });
 });
 
 // NFL
 app.get("/scores/nfl", async (req, res) => {
-    const match = await getSportScores("american_football", 4391);
+    const match = await getSportScoresCached("american_football", 4391, "nfl");
     res.json(match ? formatMatch(match) : { headline: "No NFL data available." });
 });
 
 // NHL
 app.get("/scores/nhl", async (req, res) => {
-    const match = await getSportScores("hockey", 4380);
+    const match = await getSportScoresCached("hockey", 4380, "nhl");
     res.json(match ? formatMatch(match) : { headline: "No NHL data available." });
 });
 
