@@ -66,16 +66,29 @@ async function getSportScores(sport, leagueId) {
 function formatMatchResponse(match) {
     if (!match) return { headline: "No data available." };
 
-    const headline = match.isLive
-        ? `${match.strHomeTeam} vs ${match.strAwayTeam} - LIVE`
-        : `${match.strHomeTeam} vs ${match.strAwayTeam} on ${match.dateEvent || "TBD"}`;
+    // Default status
+    let statusText = "Scheduled";
+
+    if (match.strStatus) {
+        const status = match.strStatus.toLowerCase();
+        if (status.includes("live") || status.includes("playing")) {
+            statusText = "LIVE";
+        } else if (status.includes("finished") || status.includes("ended") || status.includes("ft")) {
+            statusText = "Final";
+        } else {
+            statusText = match.dateEvent ? `on ${match.dateEvent}` : "Scheduled";
+        }
+    } else {
+        // fallback if no strStatus is provided
+        statusText = match.isLive ? "LIVE" : (match.dateEvent ? `on ${match.dateEvent}` : "Scheduled");
+    }
 
     return {
         team1: match.strHomeTeam,
         score1: match.intHomeScore || "N/A",
         team2: match.strAwayTeam,
         score2: match.intAwayScore || "N/A",
-        headline: headline
+        headline: `${match.strHomeTeam} vs ${match.strAwayTeam} - ${statusText}`
     };
 }
 
