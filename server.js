@@ -4,12 +4,19 @@ const PORT = process.env.PORT || 3000;
 
 const API_KEY = "342128"; // your premium key
 
+// Smart fetch: only send header for v2 requests
 async function fetchJson(url) {
     try {
-        const response = await fetch(url, {
-            headers: { "X-API-KEY": API_KEY }
-        });
+        const options = {};
+
+        // Only add API key header for v2 requests
+        if (url.includes("/v2/")) {
+            options.headers = { "X-API-KEY": API_KEY };
+        }
+
+        const response = await fetch(url, options);
         const text = await response.text();
+
         try {
             return JSON.parse(text);
         } catch {
