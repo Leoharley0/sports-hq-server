@@ -8,8 +8,6 @@ const API_KEY = "342128"; // your premium key
 async function fetchJson(url) {
     try {
         const options = {};
-
-        // Only add API key header for v2 requests
         if (url.includes("/v2/")) {
             options.headers = { "X-API-KEY": API_KEY };
         }
@@ -33,14 +31,7 @@ async function fetchJson(url) {
 const POPULAR_SOCCER_LEAGUES = [
     "English Premier League",
     "La Liga",
-    "Serie A",
-    "Bundesliga",
-    "Ligue 1",
-    "UEFA Champions League",
-    "UEFA Europa League",
-    "FIFA World Cup",
-    "UEFA Euro Championship",
-    "Copa America"
+    "UEFA Champions League"
 ];
 
 async function getPopularSoccerMatches() {
@@ -52,8 +43,8 @@ async function getPopularSoccerMatches() {
         matches.push(...data.livescore);
     }
 
-    // 2. Past & Upcoming from multiple big leagues (v1)
-    const leagueIds = [4328, 4335, 4332, 4331, 4334, 4480, 4481, 4673, 4674, 4482];
+    // 2. Past & Upcoming from top 3 leagues only (v1)
+    const leagueIds = [4328, 4335, 4480]; // EPL, La Liga, Champions League
     for (let id of leagueIds) {
         let past = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventspastleague.php?id=${id}`);
         if (past && past.events) matches.push(...past.events);
@@ -114,9 +105,15 @@ function formatMatch(match) {
     };
 }
 
-// Soccer endpoint
+// Soccer endpoint with timeout safety
 app.get("/scores/soccer", async (req, res) => {
+    const timeout = setTimeout(() => {
+        res.json([{ headline: "Timeout: Unable to fetch soccer data in time." }]);
+    }, 9000); // 9 seconds safety
+
     const matches = await getPopularSoccerMatches();
+    clearTimeout(timeout);
+
     if (matches.length === 0) {
         return res.json([{ headline: "No major soccer games available." }]);
     }
