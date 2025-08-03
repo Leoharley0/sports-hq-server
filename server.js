@@ -29,7 +29,22 @@ async function fetchJson(url, opts = {}) {
   }
 }
 
-// Step-by-step collector
+function formatMatch({ strHomeTeam, intHomeScore, strAwayTeam, intAwayScore, strLeague, strStatus, dateEvent }) {
+  let status = "Scheduled";
+  const s = (strStatus || "").toLowerCase();
+  if (s.includes("live"))       status = "LIVE";
+  else if (s.includes("finished")||s.includes("ended")||s.includes("ft")) status = "Final";
+  else if (dateEvent)           status = `on ${dateEvent}`;
+  return {
+    team1: strHomeTeam,
+    score1: intHomeScore  || "N/A",
+    team2: strAwayTeam,
+    score2: intAwayScore  || "N/A",
+    league: strLeague,
+    headline: `${strHomeTeam} vs ${strAwayTeam} - ${status}`
+  };
+}
+
 async function getMatches(sport, espnPath) {
   const results = [];
   const majors = MAJOR[sport] || [];
@@ -39,45 +54,41 @@ async function getMatches(sport, espnPath) {
     `https://www.thesportsdb.com/api/v2/json/livescore/${sport}`,
     { headers: { "X-API-KEY": API_KEY } }
   );
-  for (const m of tsdb?.livescore || []) {
+  for (const m of tsdb?.livescore||[]) {
     if (results.length >= 5) break;
     if (majors.includes(m.strLeague)) {
-      let status = (m.strStatus || "").toLowerCase().includes("live") ? "LIVE" : m.strStatus || "Scheduled";
-      if (!m.strStatus && m.intHomeScore && m.intAwayScore) status = "Final";
-      results.push({
-        team1: m.strHomeTeam,
-        score1: m.intHomeScore || "N/A",
-        team2: m.strAwayTeam,
-        score2: m.intAwayScore || "N/A",
-        league: m.strLeague,
-        headline: `${m.strHomeTeam} vs ${m.strAwayTeam} - ${status}`
-      });
+      results.push(formatMatch(m));
     }
   }
 
   // 2️⃣ Upcoming & Completed from ESPN
   if (results.length < 5) {
     const espn = await fetchJson(`https://site.api.espn.com/apis/site/v2/sports/${espnPath}/scoreboard`);
-    for (const e of espn?.events || []) {
+    for (const e of espn?.events||[]) {
       if (results.length >= 5) break;
-      const c = e.competitions?.[0];
-      const home = c?.competitors.find(x => x.homeAway === "home");
-      const away = c?.competitors.find(x => x.homeAway === "away");
-      if (!home || !away) continue;
-      // only major league events
-      if (!majors.includes(c.league.name)) continue;
+      const c0 = e.competitions?.[0];
+      if (!c0) continue;
 
-      let state = e.status.type.state;           // PRE / IN / POST
-      let status = state === "IN"  ? "LIVE"
-                 : state === "POST"? "Final"
-                 :                    "Scheduled";
+      const home = c0.competitors.find(x => x.homeAway === "home");
+      const away = c0.competitors.find(x => x.homeAway === "away");
+      if (!home || !away) continue;
+
+      // league name correctly pulled from e.leagues[0].name
+      const leagueName = e.leagues?.[0]?.name;
+      if (!majors.includes(leagueName)) continue;
+
+      // determine status
+      const state = e.status?.type?.state; // PRE / IN / POST
+      let status = state === "IN" ? "LIVE"
+                 : state === "POST" ? "Final"
+                 : "Scheduled";
 
       results.push({
         team1: home.team.displayName,
         score1: home.score || "N/A",
         team2: away.team.displayName,
         score2: away.score || "N/A",
-        league: c.league.name,
+        league: leagueName,
         headline: `${home.team.displayName} vs ${away.team.displayName} - ${status}`
       });
     }
@@ -104,7 +115,7 @@ app.get("/scores/nhl", async (req, res) => {
   res.json(m.length ? m : [{ headline: "No NHL games right now." }]);
 });
 
-// Debug any URL
+// Debug
 app.get("/scores/debug", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send("Provide ?url=");
