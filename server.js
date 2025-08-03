@@ -3,11 +3,11 @@ const fetch   = require("node-fetch");
 const app     = express();
 const PORT    = process.env.PORT || 3000;
 
-const API_KEY = "342128"; // your TheSportsDB key
+const API_KEY = "342128"; // your TheSportsDB v2 key
 
 // 1️⃣ Whitelist of major leagues for TSDB live filtering
 const MAJOR = {
-  soccer:            ["English Premier League","La Liga","UEFA Champions League"],
+  soccer:            ["English Premier League", "La Liga", "UEFA Champions League"],
   basketball:        ["NBA"],
   american_football: ["NFL"],
   ice_hockey:        ["NHL"]
@@ -21,7 +21,7 @@ const DEFAULT_LEAGUE = {
   ice_hockey:        "NHL"
 };
 
-// 3️⃣ Map our sport codes to ESPN scoreboard paths
+// 3️⃣ Map sport codes to ESPN scoreboard paths
 function getEspnPath(sport) {
   switch (sport) {
     case "soccer":            return "soccer/eng.1";
@@ -33,29 +33,38 @@ function getEspnPath(sport) {
 }
 
 // 4️⃣ Helper to format YYYYMMDD offsets
-function dateOffset(n) {
+function dateOffset(offsetDays) {
   const d = new Date();
-  d.setDate(d.getDate() + n);
-  return d.toISOString().slice(0,10).replace(/-/g,"");
+  d.setDate(d.getDate() + offsetDays);
+  const Y = d.getFullYear();
+  const M = String(d.getMonth() + 1).padStart(2, "0");
+  const D = String(d.getDate()).padStart(2, "0");
+  return `${Y}${M}${D}`;
 }
 
-// 5️⃣ Smart JSON fetch (only TSDB v2 needs header)
+// 5️⃣ Smart JSON fetch (TSDB v2 needs header)
 async function fetchJson(url, opts = {}) {
-  const res = await fetch(url, opts);
-  const txt = await res.text();
-  if (txt.trim().startsWith("<!DOCTYPE") || txt.trim().startsWith("<html")) {
+  try {
+    const res = await fetch(url, opts);
+    const text = await res.text();
+    if (text.trim().startsWith("<!DOCTYPE") || text.trim().startsWith("<html")) {
+      console.error("HTML error from", url);
+      return null;
+    }
+    return JSON.parse(text);
+  } catch (e) {
+    console.error("Fetch error:", e);
     return null;
   }
-  return JSON.parse(txt);
 }
 
 // 6️⃣ Format a TSDB live match
 function formatTSDB(m) {
   let status = "Scheduled";
-  const s = (m.strStatus||"").toLowerCase();
-  if (s.includes("live"))                status = "LIVE";
-  else if (/finished|ended|ft/.test(s))   status = "Final";
-  else if (m.dateEvent)                   status = `on ${m.dateEvent}`;
+  const s = (m.strStatus || "").toLowerCase();
+  if (s.includes("live"))             status = "LIVE";
+  else if (/finished|ended|ft/.test(s)) status = "Final";
+  else if (m.dateEvent)               status = `on ${m.dateEvent}`;
 
   return {
     id:       m.idEvent,
@@ -68,12 +77,12 @@ function formatTSDB(m) {
   };
 }
 
-// 7️⃣ Format an ESPN match (upcoming or completed)
+// 7️⃣ Format an ESPN match (past, live, or upcoming)
 function formatESPN(e, sport) {
-  const c  = e.competitions?.[0];
-  const h  = c?.competitors.find(x=>x.homeAway==="home");
-  const a  = c?.competitors.find(x=>x.homeAway==="away");
-  if (!h||!a) return null;
+  const comp = e.competitions?.[0];
+  const home = comp?.competitors.find(c => c.homeAway === "home");
+  const away = comp?.competitors.find(c => c.homeAway === "away");
+  if (!home || !away) return null;
 
   const started   = e.status?.type?.started;
   const completed = e.status?.type?.completed;
@@ -85,12 +94,12 @@ function formatESPN(e, sport) {
 
   return {
     id:       e.id,
-    team1:    h.team.displayName,
-    score1:   h.score || "N/A",
-    team2:    a.team.displayName,
-    score2:   a.score || "N/A",
+    team1:    home.team.displayName,
+    score1:   home.score || "N/A",
+    team2:    away.team.displayName,
+    score2:   away.score || "N/A",
     league:   leagueName,
-    headline: `${h.team.displayName} vs ${a.team.displayName} - ${status}`
+    headline: `${home.team.displayName} vs ${away.team.displayName} - ${status}`
   };
 }
 
@@ -103,55 +112,31 @@ async function getMatches(sport) {
   // a) TSDB live (v2)
   const liveData = await fetchJson(
     `https://www.thesportsdb.com/api/v2/json/livescore/${sport}`,
-    { headers:{ "X-API-KEY":API_KEY } }
+    { headers: { "X-API-KEY": API_KEY } }
   );
-  for (const m of liveData?.livescore||[]) {
-    if (results.length>=5) break;
+  for (const m of liveData?.livescore || []) {
+    if (results.length >= 5) break;
     if (!majors.includes(m.strLeague)) continue;
     const fm = formatTSDB(m);
     results.push(fm);
     seen.add(fm.id);
   }
 
-  // b) ESPN upcoming (today + next 2 days)
-  if (results.length<5) {
-    const path = getEspnPath(sport);
-    for (let d=0; d<3 && results.length<5; d++) {
-      const espn = await fetchJson(
-        `https://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard?dates=${dateOffset(d)}`
-      );
-      for (const e of espn?.events||[]) {
-        if (results.length>=5) break;
-        if (seen.has(e.id)) continue;
-        const fm = formatESPN(e, sport);
-        if (!fm) continue;
-        // only include upcoming & live here
-        if (e.status?.type?.started && !e.status?.type?.completed) {
-          results.push(fm);
-          seen.add(e.id);
-        } else if (e.status?.type?.state==="PRE") {
-          results.push(fm);
-          seen.add(e.id);
-        }
-      }
-    }
-  }
+  // b) ESPN extended fallback (past, live, upcoming over 1 year)
+  if (results.length < 5) {
+    const path  = getEspnPath(sport);
+    const start = dateOffset(0);
+    const end   = dateOffset(365);
+    const url   = `https://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard?dates=${start}-${end}`;
 
-  // c) ESPN completed (yesterday + 2 days prior)
-  if (results.length<5) {
-    const path = getEspnPath(sport);
-    for (let d=1; d<=3 && results.length<5; d++) {
-      const espn = await fetchJson(
-        `https://site.api.espn.com/apis/site/v2/sports/${path}/scoreboard?dates=${dateOffset(-d)}`
-      );
-      for (const e of espn?.events||[]) {
-        if (results.length>=5) break;
-        if (seen.has(e.id)) continue;
-        const fm = formatESPN(e, sport);
-        if (!fm) continue;
-        results.push(fm);
-        seen.add(e.id);
-      }
+    const espnAll = await fetchJson(url);
+    for (const e of espnAll?.events || []) {
+      if (results.length >= 5) break;
+      if (seen.has(e.id)) continue;
+      const fm = formatESPN(e, sport);
+      if (!fm) continue;
+      results.push(fm);
+      seen.add(e.id);
     }
   }
 
@@ -159,34 +144,51 @@ async function getMatches(sport) {
 }
 
 // 9️⃣ HTTP endpoints
-app.get("/scores/soccer",            async (req,res)=> {
+app.get("/scores/soccer", async (req, res) => {
   const m = await getMatches("soccer");
-  res.json(m.length? m : [{headline:"No soccer games found."}]);
+  res.json(m.length
+    ? m
+    : [{ headline: "No soccer games found." }]
+  );
 });
-app.get("/scores/nba",               async (req,res)=> {
+
+app.get("/scores/nba", async (req, res) => {
   const m = await getMatches("basketball");
-  res.json(m.length? m : [{headline:"No NBA games found."}]);
+  res.json(m.length
+    ? m
+    : [{ headline: "No NBA games found." }]
+  );
 });
-app.get("/scores/nfl",               async (req,res)=> {
+
+app.get("/scores/nfl", async (req, res) => {
   const m = await getMatches("american_football");
-  res.json(m.length? m : [{headline:"No NFL games found."}]);
+  res.json(m.length
+    ? m
+    : [{ headline: "No NFL games found." }]
+  );
 });
-app.get("/scores/nhl",               async (req,res)=> {
+
+app.get("/scores/nhl", async (req, res) => {
   const m = await getMatches("ice_hockey");
-  res.json(m.length? m : [{headline:"No NHL games found."}]);
+  res.json(m.length
+    ? m
+    : [{ headline: "No NHL games found." }]
+  );
 });
 
 // 🔧 Debug any URL
-app.get("/scores/debug", async (req,res)=> {
+app.get("/scores/debug", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send("Provide ?url=");
   try {
-    const t = await (await fetch(url)).text();
-    res.type("text/plain").send(t);
+    const text = await (await fetch(url)).text();
+    res.type("text/plain").send(text);
   } catch (e) {
-    res.send("Error: "+e);
+    res.send("Error: " + e);
   }
 });
 
 // 🔥 Start server
-app.listen(PORT,()=> console.log(`Listening on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Sports HQ server running on port ${PORT}`);
+});
