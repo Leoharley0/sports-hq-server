@@ -29,35 +29,31 @@ async function getSportScores(sport, leagueId) {
     if (sport) {
         data = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
         if (data && data.livescore && data.livescore.length > 0) {
-            console.log(`Got live ${sport} data!`);
+            console.log(`Got ${sport} livescore data`);
             const match = data.livescore[0];
-            return {
-                ...match,
-                isLive: true
-            };
+
+            // Mark live only if strStatus says so
+            match.isLive = match.strStatus && match.strStatus.toLowerCase().includes("live");
+            return match;
         }
     }
 
     // 2. Past games (v1)
     data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventspastleague.php?id=${leagueId}`);
     if (data && data.events && data.events.length > 0) {
-        console.log(`Got past ${leagueId} results!`);
+        console.log(`Got past ${leagueId} results`);
         const match = data.events[0];
-        return {
-            ...match,
-            isLive: false
-        };
+        match.isLive = false;
+        return match;
     }
 
     // 3. Upcoming games (v1)
     data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventsnextleague.php?id=${leagueId}`);
     if (data && data.events && data.events.length > 0) {
-        console.log(`Got upcoming ${leagueId} schedule!`);
+        console.log(`Got upcoming ${leagueId} schedule`);
         const match = data.events[0];
-        return {
-            ...match,
-            isLive: false
-        };
+        match.isLive = false;
+        return match;
     }
 
     return null;
@@ -66,7 +62,6 @@ async function getSportScores(sport, leagueId) {
 function formatMatchResponse(match) {
     if (!match) return { headline: "No data available." };
 
-    // Default status
     let statusText = "Scheduled";
 
     if (match.strStatus) {
@@ -79,7 +74,6 @@ function formatMatchResponse(match) {
             statusText = match.dateEvent ? `on ${match.dateEvent}` : "Scheduled";
         }
     } else {
-        // fallback if no strStatus is provided
         statusText = match.isLive ? "LIVE" : (match.dateEvent ? `on ${match.dateEvent}` : "Scheduled");
     }
 
@@ -92,7 +86,7 @@ function formatMatchResponse(match) {
     };
 }
 
-// Soccer
+// Soccer (EPL)
 app.get("/scores/soccer", async (req, res) => {
     const match = await getSportScores("soccer", 4328);
     res.json(formatMatchResponse(match));
