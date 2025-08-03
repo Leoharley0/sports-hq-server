@@ -36,23 +36,22 @@ const POPULAR_SOCCER_LEAGUES = [
     "Copa America"
 ];
 
-// Fetch soccer matches with popularity filter
 async function getPopularSoccerMatches() {
     let matches = [];
 
-    // 1. Live soccer
+    // 1. Live soccer (v2)
     let data = await fetchJson("https://www.thesportsdb.com/api/v2/json/livescore/soccer");
     if (data && data.livescore) {
         matches.push(...data.livescore);
     }
 
-    // 2. Past/Upcoming from multiple big leagues
+    // 2. Past & Upcoming from multiple big leagues (v1)
     const leagueIds = [4328, 4335, 4332, 4331, 4334, 4480, 4481, 4673, 4674, 4482];
     for (let id of leagueIds) {
-        let past = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventspastleague.php?id=${id}`);
+        let past = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventspastleague.php?id=${id}`);
         if (past && past.events) matches.push(...past.events);
 
-        let next = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventsnextleague.php?id=${id}`);
+        let next = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventsnextleague.php?id=${id}`);
         if (next && next.events) matches.push(...next.events);
     }
 
@@ -79,7 +78,7 @@ async function getPopularSoccerMatches() {
         return score(b) - score(a);
     });
 
-    return matches.slice(0, 5); // limit to 5 matches
+    return matches.slice(0, 5); // top 5
 }
 
 function formatMatch(match) {
@@ -117,6 +116,36 @@ app.get("/scores/soccer", async (req, res) => {
     res.json(matches.map(formatMatch));
 });
 
+// Generic sports function for NBA/NFL/NHL
+async function getSportScores(sport, leagueId) {
+    let data = null;
+
+    if (sport) {
+        data = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
+        if (data && data.livescore && data.livescore.length > 0) {
+            const match = data.livescore[0];
+            match.isLive = match.strStatus && match.strStatus.toLowerCase().includes("live");
+            return match;
+        }
+    }
+
+    data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventspastleague.php?id=${leagueId}`);
+    if (data && data.events && data.events.length > 0) {
+        const match = data.events[0];
+        match.isLive = false;
+        return match;
+    }
+
+    data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${API_KEY}/eventsnextleague.php?id=${leagueId}`);
+    if (data && data.events && data.events.length > 0) {
+        const match = data.events[0];
+        match.isLive = false;
+        return match;
+    }
+
+    return null;
+}
+
 // NBA
 app.get("/scores/nba", async (req, res) => {
     const match = await getSportScores("basketball", 4387);
@@ -153,33 +182,3 @@ app.get("/scores/debug", async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Sports HQ server running on http://localhost:${PORT}`);
 });
-
-// Reuse getSportScores from before
-async function getSportScores(sport, leagueId) {
-    let data = null;
-
-    if (sport) {
-        data = await fetchJson(`https://www.thesportsdb.com/api/v2/json/livescore/${sport}`);
-        if (data && data.livescore && data.livescore.length > 0) {
-            const match = data.livescore[0];
-            match.isLive = match.strStatus && match.strStatus.toLowerCase().includes("live");
-            return match;
-        }
-    }
-
-    data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventspastleague.php?id=${leagueId}`);
-    if (data && data.events && data.events.length > 0) {
-        const match = data.events[0];
-        match.isLive = false;
-        return match;
-    }
-
-    data = await fetchJson(`https://www.thesportsdb.com/api/v1/json/eventsnextleague.php?id=${leagueId}`);
-    if (data && data.events && data.events.length > 0) {
-        const match = data.events[0];
-        match.isLive = false;
-        return match;
-    }
-
-    return null;
-}
