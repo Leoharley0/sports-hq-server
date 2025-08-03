@@ -5,7 +5,7 @@ const PORT = process.env.PORT || 3000;
 
 const API_KEY = "342128"; // your TheSportsDB key
 
-// Whitelist of big leagues per sport
+// Whitelist of big leagues for TSDB live
 const MAJOR = {
   soccer:           ["English Premier League", "La Liga", "UEFA Champions League"],
   basketball:       ["NBA"],
@@ -13,82 +13,94 @@ const MAJOR = {
   ice_hockey:       ["NHL"]
 };
 
-// Helper: only send TSDB header on v2 calls
+// Only TSDB v2 needs the header
 async function fetchJson(url, opts = {}) {
   try {
     const res = await fetch(url, opts);
-    const txt = await res.text();
-    if (txt.trim().startsWith("<!DOCTYPE") || txt.trim().startsWith("<html")) {
+    const text = await res.text();
+    if (text.trim().startsWith("<!DOCTYPE") || text.trim().startsWith("<html")) {
       console.error("HTML error from", url);
       return null;
     }
-    return JSON.parse(txt);
+    return JSON.parse(text);
   } catch (e) {
     console.error("Fetch error:", e);
     return null;
   }
 }
 
-function formatMatch({ strHomeTeam, intHomeScore, strAwayTeam, intAwayScore, strLeague, strStatus, dateEvent }) {
-  let status = "Scheduled";
-  const s = (strStatus || "").toLowerCase();
-  if (s.includes("live"))       status = "LIVE";
-  else if (s.includes("finished")||s.includes("ended")||s.includes("ft")) status = "Final";
-  else if (dateEvent)           status = `on ${dateEvent}`;
+// Build ESPN path per sport
+function getEspnPath(sport) {
+  switch (sport) {
+    case "soccer":           return "soccer/eng.1";
+    case "basketball":       return "basketball/nba";
+    case "american_football":return "football/nfl";
+    case "ice_hockey":       return "hockey/nhl";
+  }
+}
+
+// Format a TSDB match
+function formatTSDB(m) {
+  let status = (m.strStatus||"").toLowerCase().includes("live")
+    ? "LIVE"
+    : m.strStatus
+      ? m.strStatus
+      : (m.intHomeScore && m.intAwayScore)
+        ? "Final"
+        : m.dateEvent
+          ? `on ${m.dateEvent}`
+          : "Scheduled";
+
   return {
-    team1: strHomeTeam,
-    score1: intHomeScore  || "N/A",
-    team2: strAwayTeam,
-    score2: intAwayScore  || "N/A",
-    league: strLeague,
-    headline: `${strHomeTeam} vs ${strAwayTeam} - ${status}`
+    team1: m.strHomeTeam,
+    score1:m.intHomeScore || "N/A",
+    team2: m.strAwayTeam,
+    score2:m.intAwayScore || "N/A",
+    league: m.strLeague,
+    headline: `${m.strHomeTeam} vs ${m.strAwayTeam} - ${status}`
   };
 }
 
-async function getMatches(sport, espnPath) {
+// Collect up to 5: live → upcoming & completed (ESPN)
+async function getMatches(sport) {
   const results = [];
   const majors = MAJOR[sport] || [];
 
-  // 1️⃣ Live from TheSportsDB
+  // 1️⃣ Live from TSDB
   const tsdb = await fetchJson(
     `https://www.thesportsdb.com/api/v2/json/livescore/${sport}`,
     { headers: { "X-API-KEY": API_KEY } }
   );
-  for (const m of tsdb?.livescore||[]) {
-    if (results.length >= 5) break;
+  for (let m of tsdb?.livescore||[]) {
+    if (results.length>=5) break;
     if (majors.includes(m.strLeague)) {
-      results.push(formatMatch(m));
+      results.push(formatTSDB(m));
     }
   }
 
-  // 2️⃣ Upcoming & Completed from ESPN
-  if (results.length < 5) {
-    const espn = await fetchJson(`https://site.api.espn.com/apis/site/v2/sports/${espnPath}/scoreboard`);
-    for (const e of espn?.events||[]) {
-      if (results.length >= 5) break;
-      const c0 = e.competitions?.[0];
-      if (!c0) continue;
+  // 2️⃣ ESPN fallback (no extra whitelist)
+  if (results.length<5) {
+    const espn = await fetchJson(`https://site.api.espn.com/apis/site/v2/sports/${getEspnPath(sport)}/scoreboard`);
+    for (let e of espn?.events||[]) {
+      if (results.length>=5) break;
+      const c = e.competitions?.[0];
+      if (!c) continue;
+      const home = c.competitors.find(x=>x.homeAway==="home");
+      const away = c.competitors.find(x=>x.homeAway==="away");
+      if (!home||!away) continue;
 
-      const home = c0.competitors.find(x => x.homeAway === "home");
-      const away = c0.competitors.find(x => x.homeAway === "away");
-      if (!home || !away) continue;
-
-      // league name correctly pulled from e.leagues[0].name
-      const leagueName = e.leagues?.[0]?.name;
-      if (!majors.includes(leagueName)) continue;
-
-      // determine status
+      // Determine status
       const state = e.status?.type?.state; // PRE / IN / POST
-      let status = state === "IN" ? "LIVE"
-                 : state === "POST" ? "Final"
-                 : "Scheduled";
+      const status = state==="IN"   ? "LIVE"
+                   : state==="POST"? "Final"
+                   :                  "Scheduled";
 
       results.push({
         team1: home.team.displayName,
         score1: home.score || "N/A",
         team2: away.team.displayName,
         score2: away.score || "N/A",
-        league: leagueName,
+        league: c.league.name,
         headline: `${home.team.displayName} vs ${away.team.displayName} - ${status}`
       });
     }
@@ -97,36 +109,36 @@ async function getMatches(sport, espnPath) {
   return results;
 }
 
-// Endpoints
+// Four sport endpoints
 app.get("/scores/soccer", async (req, res) => {
-  const m = await getMatches("soccer",           "soccer/eng.1");
+  const m = await getMatches("soccer");
   res.json(m.length ? m : [{ headline: "No major soccer games right now." }]);
 });
 app.get("/scores/nba", async (req, res) => {
-  const m = await getMatches("basketball",       "basketball/nba");
+  const m = await getMatches("basketball");
   res.json(m.length ? m : [{ headline: "No NBA games right now." }]);
 });
 app.get("/scores/nfl", async (req, res) => {
-  const m = await getMatches("american_football","football/nfl");
+  const m = await getMatches("american_football");
   res.json(m.length ? m : [{ headline: "No NFL games right now." }]);
 });
 app.get("/scores/nhl", async (req, res) => {
-  const m = await getMatches("ice_hockey",       "hockey/nhl");
+  const m = await getMatches("ice_hockey");
   res.json(m.length ? m : [{ headline: "No NHL games right now." }]);
 });
 
-// Debug
+// Debug any URL
 app.get("/scores/debug", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).send("Provide ?url=");
   try {
-    const text = await (await fetch(url)).text();
-    res.type("text/plain").send(text);
+    const t = await (await fetch(url)).text();
+    res.type("text/plain").send(t);
   } catch (e) {
-    res.send("Error: " + e);
+    res.send("Error: "+e);
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Sports HQ listening on port ${PORT}`);
-});
+app.listen(PORT,() =>
+  console.log(`Sports HQ running on http://localhost:${PORT}`)
+);
