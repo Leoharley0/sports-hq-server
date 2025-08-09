@@ -4,7 +4,7 @@ const fetch   = require("node-fetch");
 
 const app     = express();
 const PORT    = process.env.PORT || 3000;
-const API_KEY = process.env.TSDB_KEY || "<342128>";
+const API_KEY = process.env.TSDB_KEY || "342128";
 
 // --- helpers ---------------------------------------------------------------
 async function fetchJson(url) {
