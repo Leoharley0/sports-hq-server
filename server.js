@@ -4,22 +4,21 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 /* Render → Environment (no quotes):
-   TSDB_V2_KEY = your v2 key   (required)
-   TSDB_V1_KEY = 1             (or your v1 key; used only as fallback) */
+   TSDB_V2_KEY = your v2 key   (required for all v2 calls)
+   TSDB_V1_KEY = 1             (or your v1 key; only used as fallback)
+*/
 const V2_KEY = process.env.TSDB_V2_KEY || process.env.TSDB_KEY || "";
 const V1_KEY = process.env.TSDB_V1_KEY || "1";
 
-/* Make TSDB/CDN happy */
+/* Friendly headers (avoid 404 HTML from CDN) */
 const COMMON_HEADERS = {
   "User-Agent": "SportsHQ/1.0 (+render.com)",
   "Accept": "application/json",
-  "Referer": "https://sports-hq-server.onrender.com/",
 };
 
 async function fetchJson(url, extraHeaders = {}) {
-  const headers = { ...COMMON_HEADERS, ...extraHeaders };
   try {
-    const res = await fetch(url, { headers });
+    const res = await fetch(url, { headers: { ...COMMON_HEADERS, ...extraHeaders } });
     if (!res.ok) {
       const body = await res.text();
       throw new Error(`${res.status} ${res.statusText} | ${body.slice(0,200)}`);
@@ -31,14 +30,14 @@ async function fetchJson(url, extraHeaders = {}) {
   }
 }
 
+/* ---- status / format helpers ---- */
 function isLiveStatus(s = "") {
-  const t = String(s).toLowerCase();
-  return t.includes("live") || t.includes("in play") ||
-         /^q\d/.test(t) || t.includes("quarter") ||
-         t.includes("ot") || t.includes("overtime") || t.includes("half");
+  const t = (s + "").toLowerCase();
+  return t.includes("live") || t.includes("in play") || /^q\d/.test(t) ||
+         t.includes("quarter") || t.includes("ot") || t.includes("overtime") || t.includes("half");
 }
 function isFinalStatus(s = "") {
-  const t = String(s).toLowerCase();
+  const t = (s + "").toLowerCase();
   return t.includes("final") || t === "ft" || t.includes("full time");
 }
 function pickScore(v) {
@@ -57,10 +56,12 @@ function formatMatch(m) {
   const s1 = pickScore(m.intHomeScore ?? m.intHomeScoreTotal ?? m.intHomeScore1 ?? m.intHomeGoals);
   const s2 = pickScore(m.intAwayScore ?? m.intAwayScoreTotal ?? m.intAwayScore1 ?? m.intAwayGoals);
   const status = normalizeStatus(m);
-  return { team1: home, team2: away,
-           score1: s1 === null ? "N/A" : String(s1),
-           score2: s2 === null ? "N/A" : String(s2),
-           headline: `${home} vs ${away} - ${status}` };
+  return {
+    team1: home, team2: away,
+    score1: s1 === null ? "N/A" : String(s1),
+    score2: s2 === null ? "N/A" : String(s2),
+    headline: `${home} vs ${away} - ${status}`,
+  };
 }
 function pushUnique(arr, m) {
   const key = m.idEvent || `${m.strHomeTeam}|${m.strAwayTeam}|${m.dateEvent}|${m.strTime}`;
@@ -69,7 +70,9 @@ function pushUnique(arr, m) {
   }
 }
 
-/* --- v2 helpers (header) --- */
+/* ---- v2 REST endpoints (header key) ---- */
+const V2H = { "X-API-KEY": V2_KEY };
+
 async function v2Livescore(sport) {
   const s = sport.replace(/_/g, " ");
   const urls = [
@@ -78,27 +81,36 @@ async function v2Livescore(sport) {
   ];
   const out = [];
   for (const u of urls) {
-    const j = await fetchJson(u, { "X-API-KEY": V2_KEY });
+    const j = await fetchJson(u, V2H);
     if (j?.livescore?.length) out.push(...j.livescore);
   }
   return out;
 }
+
+// NOTE: v2 uses REST (no .php) for events
 async function v2NextLeague(leagueId) {
   const j = await fetchJson(
-    `https://www.thesportsdb.com/api/v2/json/eventsnextleague.php?id=${leagueId}`,
-    { "X-API-KEY": V2_KEY }
+    `https://www.thesportsdb.com/api/v2/json/events/next/league/${leagueId}`,
+    V2H
   );
   return Array.isArray(j?.events) ? j.events : [];
 }
 async function v2Season(leagueId, season) {
   const j = await fetchJson(
-    `https://www.thesportsdb.com/api/v2/json/eventsseason.php?id=${leagueId}&s=${encodeURIComponent(season)}`,
-    { "X-API-KEY": V2_KEY }
+    `https://www.thesportsdb.com/api/v2/json/events/season/league/${leagueId}/${encodeURIComponent(season)}`,
+    V2H
+  );
+  return Array.isArray(j?.events) ? j.events : [];
+}
+async function v2PastLeague(leagueId) {
+  const j = await fetchJson(
+    `https://www.thesportsdb.com/api/v2/json/events/past/league/${leagueId}`,
+    V2H
   );
   return Array.isArray(j?.events) ? j.events : [];
 }
 
-/* --- v1 fallbacks (URL key) --- */
+/* ---- v1 fallbacks (URL key) ---- */
 async function v1NextLeague(leagueId) {
   const j = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${leagueId}`);
   return Array.isArray(j?.events) ? j.events : [];
@@ -112,37 +124,39 @@ async function v1PastLeague(leagueId) {
   return Array.isArray(j?.events) ? j.events : [];
 }
 
-/* Guess current cross-year season like 2024-2025 */
+/* Guess season like 2024-2025 */
 function guessSeasonString() {
   const d = new Date(); const y = d.getUTCFullYear(); const m = d.getUTCMonth()+1;
-  const start = (m >= 7) ? y : (y-1); return `${start}-${start+1}`;
+  const start = (m >= 7) ? y : (y-1);
+  return `${start}-${start+1}`;
 }
 
-/* LIVE → v2 next → v1 next → v2 season → v1 season → v1 past (fill to 5) */
+/* LIVE → v2 next → v1 next → v2 season → v1 season → v2 past → v1 past (fill to 5) */
 async function getLeagueMatches(sport, leagueId) {
   const out = [];
+
   // LIVE
   const live = await v2Livescore(sport);
-  for (const m of live) if (String(m.idLeague||"") === String(leagueId)) pushUnique(out, m);
-  console.log(`[live] ${sport} league=${leagueId} -> ${out.length}`);
+  for (const m of live || []) if (String(m.idLeague||"") === String(leagueId)) pushUnique(out, m);
+  console.log(`[live] ${sport} l=${leagueId} -> ${out.length}`);
 
-  // v2 next
+  // v2 NEXT
   if (out.length < 5) {
     const e = await v2NextLeague(leagueId);
     e.sort((a,b)=>Date.parse(a.dateEvent)-Date.parse(b.dateEvent));
     for (const m of e) { if (out.length>=5) break; pushUnique(out,m); }
-    console.log(`[next v2] ${sport} add=${out.length}`);
+    console.log(`[next v2] ${sport} -> ${out.length}`);
   }
 
-  // v1 next
+  // v1 NEXT
   if (out.length < 5) {
     const e = await v1NextLeague(leagueId);
     e.sort((a,b)=>Date.parse(a.dateEvent)-Date.parse(b.dateEvent));
     for (const m of e) { if (out.length>=5) break; pushUnique(out,m); }
-    console.log(`[next v1] ${sport} add=${out.length}`);
+    console.log(`[next v1] ${sport} -> ${out.length}`);
   }
 
-  // v2 season (future only)
+  // v2 SEASON future
   if (out.length < 5) {
     const season = guessSeasonString();
     const e = await v2Season(leagueId, season);
@@ -152,10 +166,10 @@ async function getLeagueMatches(sport, leagueId) {
       return isFinite(t) && t>=now;
     }).sort((a,b)=>Date.parse(a.dateEvent)-Date.parse(b.dateEvent));
     for (const m of fut) { if (out.length>=5) break; pushUnique(out,m); }
-    console.log(`[season v2] ${sport} add=${out.length}`);
+    console.log(`[season v2] ${sport} -> ${out.length}`);
   }
 
-  // v1 season (future only)
+  // v1 SEASON future
   if (out.length < 5) {
     const season = guessSeasonString();
     const e = await v1Season(leagueId, season);
@@ -165,19 +179,23 @@ async function getLeagueMatches(sport, leagueId) {
       return isFinite(t) && t>=now;
     }).sort((a,b)=>Date.parse(a.dateEvent)-Date.parse(b.dateEvent));
     for (const m of fut) { if (out.length>=5) break; pushUnique(out,m); }
-    console.log(`[season v1] ${sport} add=${out.length}`);
+    console.log(`[season v1] ${sport} -> ${out.length}`);
   }
 
-  // v1 past finals
+  // v2 PAST finals
+  if (out.length < 5) {
+    const e = await v2PastLeague(leagueId);
+    e.sort((a,b)=>Date.parse(b.dateEvent)-Date.parse(a.dateEvent));
+    for (const m of e) { if (out.length>=5) break; m.strStatus = m.strStatus || "Final"; pushUnique(out,m); }
+    console.log(`[past v2] ${sport} -> ${out.length}`);
+  }
+
+  // v1 PAST finals
   if (out.length < 5) {
     const e = await v1PastLeague(leagueId);
-    e.sort((a,b)=>Date.parse(b.dateEvent)-Date.parse(a.dateEvent)); // newest first
-    for (const m of e) {
-      if (out.length>=5) break;
-      m.strStatus = m.strStatus || "Final";
-      pushUnique(out,m);
-    }
-    console.log(`[past v1] ${sport} add=${out.length}`);
+    e.sort((a,b)=>Date.parse(b.dateEvent)-Date.parse(a.dateEvent));
+    for (const m of e) { if (out.length>=5) break; m.strStatus = m.strStatus || "Final"; pushUnique(out,m); }
+    console.log(`[past v1] ${sport} -> ${out.length}`);
   }
 
   return out.slice(0,5);
@@ -194,9 +212,9 @@ const CONFIGS = {
 for (const [path, cfg] of Object.entries(CONFIGS)) {
   app.get(path, async (req, res) => {
     try {
-      const raw = await getLeagueMatches(cfg.sport, cfg.leagueId);
-      console.log(`${path} -> ${raw.length} items`);
-      res.json(raw.map(formatMatch));
+      const items = await getLeagueMatches(cfg.sport, cfg.leagueId);
+      console.log(`${path} → ${items.length} items`);
+      res.json(items.map(formatMatch));
     } catch (e) {
       console.error(path, "handler error:", e);
       res.status(500).json({ error: "internal" });
@@ -206,5 +224,4 @@ for (const [path, cfg] of Object.entries(CONFIGS)) {
 
 app.get("/", (_, res) => res.send("Sports HQ server ok"));
 app.get("/health", (_, res) => res.json({ ok: true }));
-
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
