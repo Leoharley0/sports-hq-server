@@ -86,24 +86,24 @@ async function fetchLiveForSport(sport) {
   return out;
 }
 
-// live then upcoming (fill to 5)
 async function getLeagueMatches(sport, leagueId) {
   const out = [];
 
-  // LIVE (strict league filter; skip rows without idLeague)
+  // 1) LIVE (v2 with header; strict league filter)
   const live = await fetchLiveForSport(sport);
-  for (const m of live) {
+  for (const m of live || []) {
     if (String(m.idLeague || "") === String(leagueId)) {
       pushUnique(out, m);
     }
   }
 
-  // UPCOMING (fill to 5) – v1 uses key in URL
+  // 2) UPCOMING (v1) — fill to 5
   if (out.length < 5) {
     const up = await fetchJson(
       `https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${leagueId}`
     );
     const events = Array.isArray(up?.events) ? up.events : [];
+    // sort by soonest
     events.sort((a, b) => {
       const da = new Date(`${a.dateEvent}T${(a.strTime || "00:00:00").replace(" ", "")}Z`);
       const db = new Date(`${b.dateEvent}T${(b.strTime || "00:00:00").replace(" ", "")}Z`);
@@ -115,7 +115,28 @@ async function getLeagueMatches(sport, leagueId) {
     }
   }
 
+  // 3) FALLBACK (v1 past) — if still <5, show most recent finals
+  if (out.length < 5) {
+    const past = await fetchJson(
+      `https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventspastleague.php?id=${leagueId}`
+    );
+    let events = Array.isArray(past?.events) ? past.events : [];
+    // latest first
+    events.sort((a, b) => {
+      const da = new Date(`${a.dateEvent}T${(a.strTime || "00:00:00").replace(" ", "")}Z`);
+      const db = new Date(`${b.dateEvent}T${(b.strTime || "00:00:00").replace(" ", "")}Z`);
+      return db - da;
+    });
+    for (const m of events) {
+      if (out.length >= 5) break;
+      // mark status Final so the client shows scores properly
+      m.strStatus = m.strStatus || "Final";
+      pushUnique(out, m);
+    }
+  }
+
   return out.slice(0, 5);
+}
 }
 
 // endpoints
