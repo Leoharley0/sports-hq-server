@@ -3,9 +3,9 @@ const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Set these in Render → Environment (no quotes)
+// Env keys (set in Render → Environment; no quotes in the UI)
 const V2_KEY = process.env.TSDB_V2_KEY || process.env.TSDB_KEY || "342128";
-const V1_KEY = process.env.TSDB_V1_KEY || "1"; // v1 public key is fine for 'upcoming'
+const V1_KEY = process.env.TSDB_V1_KEY || "1"; // v1 public key ok for upcoming
 
 // ---------- helpers ----------
 async function fetchJson(url, headers = {}) {
@@ -37,9 +37,9 @@ function pickScore(v) {
   return (v === undefined || v === null || v === "" || v === "N/A") ? null : v;
 }
 
-// DO NOT use strTime as status (caused false "LIVE")
+// DON'T use strTime as status
 function normalizeStatus(m) {
-  const raw = m.strStatus || m.strProgress || "";   // no strTime
+  const raw = m.strStatus || m.strProgress || "";
   if (isLiveStatus(raw)) return "LIVE";
   if (raw === "NS" || raw === "" || raw == null) return "Scheduled";
   if (isFinalStatus(raw)) return "Final";
@@ -69,12 +69,12 @@ function pushUnique(arr, m) {
   }
 }
 
-// v2 livescore with header; try both endpoints and handle NFL spacing
+// v2 livescore with header; try both endpoints, fix NFL spacing
 async function fetchLiveForSport(sport) {
-  const s = sport.replace(/_/g, " "); // "american_football" -> "american football"
+  const s = sport.replace(/_/g, " "); // american_football -> american football
   const urls = [
     `https://www.thesportsdb.com/api/v2/json/livescore/${encodeURIComponent(s)}`,
-    `https://www.thesportsdb.com/api/v2/json/livescore.php?s=${encodeURIComponent(s)}`,
+    `https://www.thesportsdb.com/api/v2/json/livescore.php?s=${encodeURIComponent(s)}`
   ];
   const headers = { "X-API-KEY": V2_KEY };
 
@@ -86,24 +86,22 @@ async function fetchLiveForSport(sport) {
   return out;
 }
 
+// LIVE → UPCOMING → PAST (fill to 5)
 async function getLeagueMatches(sport, leagueId) {
   const out = [];
 
-  // 1) LIVE (v2 with header; strict league filter)
+  // 1) LIVE (strict league filter)
   const live = await fetchLiveForSport(sport);
   for (const m of live || []) {
-    if (String(m.idLeague || "") === String(leagueId)) {
-      pushUnique(out, m);
-    }
+    if (String(m.idLeague || "") === String(leagueId)) pushUnique(out, m);
   }
 
-  // 2) UPCOMING (v1) — fill to 5
+  // 2) UPCOMING (v1)
   if (out.length < 5) {
     const up = await fetchJson(
       `https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${leagueId}`
     );
     const events = Array.isArray(up?.events) ? up.events : [];
-    // sort by soonest
     events.sort((a, b) => {
       const da = new Date(`${a.dateEvent}T${(a.strTime || "00:00:00").replace(" ", "")}Z`);
       const db = new Date(`${b.dateEvent}T${(b.strTime || "00:00:00").replace(" ", "")}Z`);
@@ -115,28 +113,25 @@ async function getLeagueMatches(sport, leagueId) {
     }
   }
 
-  // 3) FALLBACK (v1 past) — if still <5, show most recent finals
+  // 3) PAST (v1) fallback
   if (out.length < 5) {
     const past = await fetchJson(
       `https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventspastleague.php?id=${leagueId}`
     );
-    let events = Array.isArray(past?.events) ? past.events : [];
-    // latest first
+    const events = Array.isArray(past?.events) ? past.events : [];
     events.sort((a, b) => {
       const da = new Date(`${a.dateEvent}T${(a.strTime || "00:00:00").replace(" ", "")}Z`);
       const db = new Date(`${b.dateEvent}T${(b.strTime || "00:00:00").replace(" ", "")}Z`);
-      return db - da;
+      return db - da; // newest first
     });
     for (const m of events) {
       if (out.length >= 5) break;
-      // mark status Final so the client shows scores properly
       m.strStatus = m.strStatus || "Final";
       pushUnique(out, m);
     }
   }
 
   return out.slice(0, 5);
-}
 }
 
 // endpoints
