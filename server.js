@@ -1,16 +1,28 @@
-// server.js
+// server.js — TSDB-only (v2 LIVE + v1 NEXT/SEASON/PAST) with /diag
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* Set these in Render → Environment (no quotes):
-   TSDB_V2_KEY        = your TSDB v2 key (required for LIVE)
-   FOOTBALL_DATA_KEY  = your football-data.org v4 key (required for EPL upcoming)
-*/
-const TSDB_KEY  = process.env.TSDB_V2_KEY || process.env.TSDB_KEY || "";
-const FD_KEY    = process.env.FOOTBALL_DATA_KEY || "";
+// If running on older Node, polyfill fetch
+if (typeof fetch !== "function") {
+  global.fetch = (...args) => import("node-fetch").then(m => m.default(...args));
+}
 
-/* General headers so CDNs don’t 404 with HTML */
+// Render → Environment (no quotes):
+//   TSDB_V2_KEY = your v2 key (required; header-based LIVE)
+//   TSDB_V1_KEY = your v1 key (e.g. 123; URL-based)
+const V2_KEY = process.env.TSDB_V2_KEY || "";
+const V1_KEY = process.env.TSDB_V1_KEY || "";
+
+// Fail-fast if v2 key missing
+if (!V2_KEY) {
+  console.error("❌ Missing TSDB_V2_KEY env var (required for LIVE). Set it in Render → Environment.");
+}
+if (!V1_KEY) {
+  console.warn("⚠️  TSDB_V1_KEY not set; v1 calls will fail. Set it in Render → Environment.");
+}
+
+// Friendly headers so CDNs don’t return HTML
 const COMMON_HEADERS = {
   "User-Agent": "SportsHQ/1.0 (+render.com)",
   "Accept": "application/json",
@@ -21,7 +33,7 @@ async function fetchJson(url, extraHeaders = {}) {
     const res = await fetch(url, { headers: { ...COMMON_HEADERS, ...extraHeaders } });
     if (!res.ok) {
       const body = await res.text();
-      throw new Error(`${res.status} ${res.statusText} | ${body.slice(0, 180)}`);
+      throw new Error(`${res.status} ${res.statusText} | ${body.slice(0,180)}`);
     }
     return await res.json();
   } catch (e) {
@@ -30,11 +42,7 @@ async function fetchJson(url, extraHeaders = {}) {
   }
 }
 
-/* ---------- helpers: formatting & status ---------- */
-function finalize(team1, team2, score1, score2, status) {
-  return { team1, team2, score1: String(score1 ?? "N/A"), score2: String(score2 ?? "N/A"),
-           headline: `${team1} vs ${team2} - ${status}` };
-}
+// -------- helpers: status & formatting --------
 function isLiveStatus(s = "") {
   const t = (s + "").toLowerCase();
   return t.includes("live") || t.includes("in play") || /^q\d/.test(t) ||
@@ -44,217 +52,180 @@ function isFinalStatus(s = "") {
   const t = (s + "").toLowerCase();
   return t.includes("final") || t === "ft" || t.includes("full time");
 }
-function normTSDBStatus(m) {
-  const raw = m.strStatus || m.strProgress || "";
+function pickScore(v) {
+  return (v === undefined || v === null || v === "" || v === "N/A") ? null : v;
+}
+function normalizeStatus(m) {
+  const raw = m.strStatus || m.strProgress || ""; // DO NOT use strTime
   if (isLiveStatus(raw)) return "LIVE";
   if (isFinalStatus(raw)) return "Final";
-  return raw === "NS" || raw === "" ? "Scheduled" : raw;
+  return (raw === "NS" || raw === "" || raw == null) ? "Scheduled" : raw;
+}
+function formatMatch(m) {
+  const home = m.strHomeTeam || m.homeTeam || m.strHome || "";
+  const away = m.strAwayTeam || m.awayTeam || m.strAway || "";
+  const s1 = pickScore(m.intHomeScore ?? m.intHomeScoreTotal ?? m.intHomeScore1 ?? m.intHomeGoals);
+  const s2 = pickScore(m.intAwayScore ?? m.intAwayScoreTotal ?? m.intAwayScore1 ?? m.intAwayGoals);
+  const status = normalizeStatus(m);
+  return {
+    team1: home,
+    team2: away,
+    score1: s1 === null ? "N/A" : String(s1),
+    score2: s2 === null ? "N/A" : String(s2),
+    headline: `${home} vs ${away} - ${status}`,
+  };
+}
+function pushUnique(arr, m) {
+  const key = m.idEvent || `${m.strHomeTeam}|${m.strAwayTeam}|${m.dateEvent}|${m.strTime}`;
+  if (!arr.some(x => (x.idEvent || `${x.strHomeTeam}|${x.strAwayTeam}|${x.dateEvent}|${x.strTime}`) === key)) {
+    arr.push(m);
+  }
 }
 
-/* ---------- LIVE: TheSportsDB v2 (header auth) ---------- */
-async function tsdbLive(sport, leagueId) {
-  const s = sport.replace(/_/g, " "); // "american_football" -> "american football"
+// --- quick probe helper (for /diag) ---
+async function probe(url, extraHeaders = {}) {
+  try {
+    const res = await fetch(url, { headers: { ...COMMON_HEADERS, ...extraHeaders } });
+    const text = await res.text();
+    return { ok: res.ok, status: res.status, url, preview: text.slice(0,160) };
+  } catch (e) {
+    return { ok: false, status: 0, url, error: String(e) };
+  }
+}
+
+// Cross-year season like "2025-2026"
+function guessSeasonString() {
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = d.getUTCMonth() + 1; // 1..12
+  const start = (m >= 7) ? y : (y - 1);
+  return `${start}-${start + 1}`;
+}
+
+// --- diagnostics route ---
+app.get("/diag", async (_, res) => {
+  const season = guessSeasonString();
+  const v2h = { "X-API-KEY": V2_KEY };
+
+  const checks = [];
+  checks.push({ env: {
+    node: process.version,
+    hasV2Key: !!V2_KEY, v2KeyLen: (V2_KEY||"").length,
+    hasV1Key: !!V1_KEY, v1Key: V1_KEY
+  }});
+
+  // v2 livescore (should be 200 + JSON)
+  checks.push(await probe(`https://www.thesportsdb.com/api/v2/json/livescore/soccer`, v2h));
+
+  // v1 next/season/past for NBA + NHL + EPL
+  for (const [name, id] of [["NBA",4387], ["NHL",4380], ["EPL",4328]]) {
+    checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${id}`));
+    checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsseason.php?id=${id}&s=${encodeURIComponent(season)}`));
+    checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventspastleague.php?id=${id}`));
+  }
+
+  res.json({ ok:true, season, checks });
+});
+
+// -------- TSDB v2 (header) LIVE --------
+async function v2Livescore(sport) {
+  const s = sport.replace(/_/g, " "); // american_football -> american football
   const urls = [
     `https://www.thesportsdb.com/api/v2/json/livescore/${encodeURIComponent(s)}`,
     `https://www.thesportsdb.com/api/v2/json/livescore.php?s=${encodeURIComponent(s)}`
   ];
-  const H = { "X-API-KEY": TSDB_KEY };
-  const rows = [];
-  for (const u of urls) {
-    const j = await fetchJson(u, H);
-    if (j?.livescore?.length) rows.push(...j.livescore);
-  }
   const out = [];
-  for (const m of rows) {
-    if (String(m.idLeague || "") !== String(leagueId)) continue;
-    out.push(finalize(
-      m.strHomeTeam, m.strAwayTeam,
-      m.intHomeScore ?? "N/A", m.intAwayScore ?? "N/A",
-      "LIVE"
-    ));
+  for (const u of urls) {
+    const j = await fetchJson(u, { "X-API-KEY": V2_KEY });
+    if (j?.livescore?.length) out.push(...j.livescore);
   }
   return out;
 }
 
-/* ---------- UPCOMING: EPL via football-data.org v4 ---------- */
-function normalizeEPLName(n) {
-  if (!n) return n;
-  // remove common suffixes, unify & → and
-  n = n.replace(/\s+FC$/i, "").replace(/&/g, "and");
-  const map = {
-    "AFC Bournemouth": "Bournemouth",
-    "Brighton and Hove Albion": "Brighton and Hove Albion",
-    "Wolverhampton Wanderers": "Wolverhampton Wanderers",
-    "Tottenham Hotspur": "Tottenham Hotspur",
-    "West Ham United": "West Ham United",
-    "Newcastle United": "Newcastle United",
-    "Manchester United": "Manchester United",
-    "Manchester City": "Manchester City",
-    "Nottingham Forest": "Nottingham Forest",
-    "Sheffield United": "Sheffield United",
-  };
-  return map[n] || n; // most names already match your TEAM_LOGOS
+// -------- TSDB v1 (URL key) UPCOMING & PAST --------
+async function v1NextLeague(leagueId) {
+  const j = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${leagueId}`);
+  return Array.isArray(j?.events) ? j.events : [];
 }
-async function eplUpcoming(limit = 5) {
-  if (!FD_KEY) return []; // can’t query without a key
-  const today = new Date();
-  const to = new Date(today.getTime() + 14 * 86400000);
-  const qs = `dateFrom=${today.toISOString().slice(0,10)}&dateTo=${to.toISOString().slice(0,10)}&status=SCHEDULED`;
-  const j = await fetchJson(`https://api.football-data.org/v4/competitions/PL/matches?${qs}`, { "X-Auth-Token": FD_KEY });
-  const arr = Array.isArray(j?.matches) ? j.matches : [];
-  arr.sort((a,b)=> new Date(a.utcDate) - new Date(b.utcDate));
+async function v1Season(leagueId, season) {
+  const j = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsseason.php?id=${leagueId}&s=${encodeURIComponent(season)}`);
+  return Array.isArray(j?.events) ? j.events : [];
+}
+async function v1PastLeague(leagueId) {
+  const j = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventspastleague.php?id=${leagueId}`);
+  return Array.isArray(j?.events) ? j.events : [];
+}
+
+// LIVE → NEXT → SEASON → PAST (fill to 5)
+async function getLeagueMatches(sport, leagueId) {
   const out = [];
-  for (const m of arr) {
-    if (out.length >= limit) break;
-    const home = normalizeEPLName(m.homeTeam?.name);
-    const away = normalizeEPLName(m.awayTeam?.name);
-    out.push(finalize(home, away, "N/A", "N/A", "Scheduled"));
+
+  // 1) LIVE (strict league match)
+  const live = await v2Livescore(sport);
+  for (const m of live || []) if (String(m.idLeague || "") === String(leagueId)) pushUnique(out, m);
+  console.log(`[live] ${sport} league=${leagueId} -> ${out.length}`);
+
+  // 2) UPCOMING (v1 next-league)
+  if (out.length < 5) {
+    const e = await v1NextLeague(leagueId);
+    e.sort((a,b) => Date.parse(`${a.dateEvent}T${(a.strTime||"00:00:00").replace(" ","")}Z`)
+                 -  Date.parse(`${b.dateEvent}T${(b.strTime||"00:00:00").replace(" ","")}Z`));
+    for (const m of e) { if (out.length >= 5) break; pushUnique(out, m); }
+    console.log(`[next v1] ${sport} -> ${out.length}`);
   }
-  // Fallback to recent FINALS if nothing upcoming
-  if (!out.length) {
-    const pastQs = `dateFrom=${new Date(today.getTime()-21*86400000).toISOString().slice(0,10)}&dateTo=${today.toISOString().slice(0,10)}&status=FINISHED`;
-    const p = await fetchJson(`https://api.football-data.org/v4/competitions/PL/matches?${pastQs}`, { "X-Auth-Token": FD_KEY });
-    const pa = Array.isArray(p?.matches) ? p.matches : [];
-    pa.sort((a,b)=> new Date(b.utcDate) - new Date(a.utcDate));
-    for (const m of pa) {
-      if (out.length >= limit) break;
-      const home = normalizeEPLName(m.homeTeam?.name);
-      const away = normalizeEPLName(m.awayTeam?.name);
-      out.push(finalize(home, away, m.score?.fullTime?.home, m.score?.fullTime?.away, "Final"));
+
+  // 3) UPCOMING (v1 eventsseason) — catches preseason if TSDB has it
+  if (out.length < 5) {
+    const season = guessSeasonString();
+    const e = await v1Season(leagueId, season);
+    const now = Date.now();
+    const fut = e.filter(x => {
+      const t = Date.parse(`${x.dateEvent}T${(x.strTime||"00:00:00").replace(" ","")}Z`);
+      return isFinite(t) && t >= now;
+    }).sort((a,b) => Date.parse(`${a.dateEvent}T${(a.strTime||"00:00:00").replace(" ","")}Z`)
+                  -  Date.parse(`${b.dateEvent}T${(b.strTime||"00:00:00").replace(" ","")}Z`));
+    for (const m of fut) { if (out.length >= 5) break; pushUnique(out, m); }
+    console.log(`[season v1 ${season}] ${sport} -> ${out.length}`);
+  }
+
+  // 4) PAST finals (v1) so screens never blank
+  if (out.length < 5) {
+    const e = await v1PastLeague(leagueId);
+    e.sort((a,b) => Date.parse(`${b.dateEvent}T${(b.strTime||"00:00:00").replace(" ","")}Z`)
+                 -  Date.parse(`${a.dateEvent}T${(a.strTime||"00:00:00").replace(" ","")}Z`));
+    for (const m of e) {
+      if (out.length >= 5) break;
+      m.strStatus = m.strStatus || "Final";
+      pushUnique(out, m);
     }
+    console.log(`[past v1] ${sport} -> ${out.length}`);
   }
-  return out.slice(0, limit);
+
+  return out.slice(0, 5);
 }
 
-/* ---------- UPCOMING: NBA via balldontlie.io ---------- */
-function normalizeNBAName(n) {
-  if (n === "LA Clippers") return "La Clippers"; // match your TEAM_LOGOS key
-  return n;
-}
-async function nbaUpcoming(limit = 5) {
-  const today = new Date();
-  const to = new Date(today.getTime() + 21 * 86400000);
-  const url = `https://www.balldontlie.io/api/v1/games?start_date=${today.toISOString().slice(0,10)}&end_date=${to.toISOString().slice(0,10)}&per_page=100`;
-  const j = await fetchJson(url);
-  const data = Array.isArray(j?.data) ? j.data : [];
-  // take scheduled first
-  const future = data.filter(g => (g.status || "").toLowerCase().includes("scheduled"));
-  future.sort((a,b)=> new Date(a.date) - new Date(b.date));
-  const out = [];
-  for (const g of future) {
-    if (out.length >= limit) break;
-    const home = normalizeNBAName(g.home_team?.full_name);
-    const away = normalizeNBAName(g.visitor_team?.full_name);
-    out.push(finalize(home, away, "N/A", "N/A", "Scheduled"));
-  }
-  // fallback to recent finals
-  if (out.length < limit) {
-    const pastUrl = `https://www.balldontlie.io/api/v1/games?end_date=${today.toISOString().slice(0,10)}&start_date=${new Date(today.getTime()-30*86400000).toISOString().slice(0,10)}&per_page=100`;
-    const pj = await fetchJson(pastUrl);
-    const past = Array.isArray(pj?.data) ? pj.data : [];
-    const finals = past.filter(g => (g.status || "").toLowerCase().includes("final"))
-                       .sort((a,b)=> new Date(b.date) - new Date(a.date));
-    for (const g of finals) {
-      if (out.length >= limit) break;
-      const home = normalizeNBAName(g.home_team?.full_name);
-      const away = normalizeNBAName(g.visitor_team?.full_name);
-      out.push(finalize(home, away, g.home_team_score, g.visitor_team_score, "Final"));
+// -------- endpoints --------
+const CONFIGS = {
+  "/scores/soccer": { sport: "soccer",            leagueId: 4328 },
+  "/scores/nba":    { sport: "basketball",        leagueId: 4387 },
+  "/scores/nfl":    { sport: "american_football", leagueId: 4391 },
+  "/scores/nhl":    { sport: "ice_hockey",        leagueId: 4380 },
+};
+
+for (const [path, cfg] of Object.entries(CONFIGS)) {
+  app.get(path, async (req, res) => {
+    try {
+      const items = await getLeagueMatches(cfg.sport, cfg.leagueId);
+      console.log(`${path} → ${items.length} items`);
+      res.json(items.map(formatMatch));
+    } catch (e) {
+      console.error(path, "handler error:", e);
+      res.status(500).json({ error: "internal" });
     }
-  }
-  return out.slice(0, limit);
+  });
 }
 
-/* ---------- UPCOMING: NHL via statsapi.web.nhl.com ---------- */
-function mapNHLStatus(s = "") {
-  const t = (s + "").toLowerCase();
-  if (t.includes("preview") || t.includes("pre-game") || t.includes("scheduled")) return "Scheduled";
-  if (t.includes("live") || t.includes("in progress")) return "LIVE";
-  if (t.includes("final")) return "Final";
-  return "Scheduled";
-}
-async function nhlUpcoming(limit = 5) {
-  const today = new Date();
-  const to = new Date(today.getTime() + 21 * 86400000);
-  const url = `https://statsapi.web.nhl.com/api/v1/schedule?startDate=${today.toISOString().slice(0,10)}&endDate=${to.toISOString().slice(0,10)}`;
-  const j = await fetchJson(url);
-  const dates = Array.isArray(j?.dates) ? j.dates : [];
-  const out = [];
-  for (const d of dates) {
-    for (const g of d.games || []) {
-      if (out.length >= limit) break;
-      const home = g.teams?.home?.team?.name;
-      const away = g.teams?.away?.team?.name;
-      const st   = mapNHLStatus(g.status?.abstractGameState || g.status?.detailedState);
-      if (st === "Scheduled") {
-        out.push(finalize(home, away, "N/A", "N/A", "Scheduled"));
-      }
-    }
-    if (out.length >= limit) break;
-  }
-  // fallback to recent finals
-  if (out.length < limit) {
-    const pastUrl = `https://statsapi.web.nhl.com/api/v1/schedule?endDate=${today.toISOString().slice(0,10)}&startDate=${new Date(today.getTime()-21*86400000).toISOString().slice(0,10)}`;
-    const p = await fetchJson(pastUrl);
-    const pd = Array.isArray(p?.dates) ? p.dates : [];
-    const finals = [];
-    for (const d of pd) {
-      for (const g of d.games || []) {
-        const st = mapNHLStatus(g.status?.abstractGameState || g.status?.detailedState);
-        if (st === "Final") {
-          finals.push(finalize(
-            g.teams?.home?.team?.name,
-            g.teams?.away?.team?.name,
-            g.teams?.home?.score,
-            g.teams?.away?.score,
-            "Final"
-          ));
-        }
-      }
-    }
-    finals.sort(() => -1); // rough newest-first (API already groups by date)
-    for (const row of finals) {
-      if (out.length >= limit) break;
-      out.push(row);
-    }
-  }
-  return out.slice(0, limit);
-}
+app.get("/",  (_, res) => res.send("Sports HQ server ok"));
+app.get("/health", (_, res) => res.json({ ok: true }));
 
-/* ---------- combined endpoints ---------- */
-async function getSoccer() {
-  const out = [];
-  // LIVE (EPL id = 4328)
-  out.push(...await tsdbLive("soccer", 4328));
-  if (out.length < 5) out.push(...await eplUpcoming(5 - out.length));
-  return out.slice(0,5);
-}
-async function getNBA() {
-  const out = [];
-  // LIVE (NBA id = 4387)
-  out.push(...await tsdbLive("basketball", 4387));
-  if (out.length < 5) out.push(...await nbaUpcoming(5 - out.length));
-  return out.slice(0,5);
-}
-async function getNFL() {
-  // You already have NFL working via TSDB live; keep as-is + small fallback
-  const out = await tsdbLive("american_football", 4391);
-  return out.slice(0,5);
-}
-async function getNHL() {
-  const out = [];
-  // LIVE (NHL id = 4380)
-  out.push(...await tsdbLive("ice_hockey", 4380));
-  if (out.length < 5) out.push(...await nhlUpcoming(5 - out.length));
-  return out.slice(0,5);
-}
-
-/* ---------- routes ---------- */
-app.get("/scores/soccer",  async (_,res)=>{ try{ const d=await getSoccer();  res.json(d);} catch(e){ console.error(e); res.json([]);} });
-app.get("/scores/nba",     async (_,res)=>{ try{ const d=await getNBA();     res.json(d);} catch(e){ console.error(e); res.json([]);} });
-app.get("/scores/nfl",     async (_,res)=>{ try{ const d=await getNFL();     res.json(d);} catch(e){ console.error(e); res.json([]);} });
-app.get("/scores/nhl",     async (_,res)=>{ try{ const d=await getNHL();     res.json(d);} catch(e){ console.error(e); res.json([]);} });
-
-app.get("/",  (_,res)=>res.send("Sports HQ server ok"));
-app.get("/health", (_,res)=>res.json({ok:true}));
-
-app.listen(PORT, ()=>console.log(`Server listening on ${PORT}`));
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
