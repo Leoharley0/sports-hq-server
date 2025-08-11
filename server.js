@@ -1,49 +1,50 @@
-// server.js — TSDB-only with caching + robust day-fill + bulletproof sorting
-// Order: recent Finals (≤15m) → LIVE → Scheduled (soonest first)
+// server.js — TSDB-only with caching + throttled day-scan + bulletproof sorting
+// Order: recent Finals (≤15m, newest first) → LIVE → Scheduled (soonest first)
+// Adds `start` ISO timestamp in each response item.
+
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Polyfill fetch for older Node
+// Polyfill fetch for older Node runtimes
 if (typeof fetch !== "function") {
   global.fetch = (...args) => import("node-fetch").then(m => m.default(...args));
 }
 
-// Env (Render → Environment)
-const V2_KEY = process.env.TSDB_V2_KEY || "";
-const V1_KEY = process.env.TSDB_V1_KEY || "";
+// Env (Render → Environment, no quotes)
+const V2_KEY = process.env.TSDB_V2_KEY || ""; // v2 header key (required for LIVE)
+const V1_KEY = process.env.TSDB_V1_KEY || ""; // v1 URL key (e.g., "123")
 if (!V2_KEY) console.error("❌ Missing TSDB_V2_KEY (required for LIVE)");
-if (!V1_KEY) console.warn("⚠️  TSDB_V1_KEY not set; v1 calls will fail");
+if (!V1_KEY) console.warn("⚠️  TSDB_V1_KEY not set; v1 calls may fail");
 
-// Friendly headers
 const COMMON_HEADERS = { "User-Agent": "SportsHQ/1.0 (+render.com)", "Accept": "application/json" };
 
 // Finals visibility window
 const FINAL_KEEP_MINUTES = 15;
 const FINAL_KEEP_MS = FINAL_KEEP_MINUTES * 60 * 1000;
 
-/* ---------------- simple in-memory cache ---------------- */
+/* ---------------- in-memory cache ---------------- */
 const cache = new Map();
 function getCache(k){ const v = cache.get(k); if (v && v.exp > Date.now()) return v.val; if (v) cache.delete(k); return null; }
 function setCache(k,val,ttl){ cache.set(k,{val,exp:Date.now()+ttl}); }
 
 /* ---------------- fetch helpers (with memo) ---------------- */
-async function fetchText(url, extraHeaders = {}) {
-  const res = await fetch(url, { headers: { ...COMMON_HEADERS, ...extraHeaders } });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText} | ${text.slice(0,180)}`);
-  return text;
+async function fetchText(url, extra = {}) {
+  const res = await fetch(url, { headers: { ...COMMON_HEADERS, ...extra } });
+  const txt = await res.text();
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText} | ${txt.slice(0,180)}`);
+  return txt;
 }
-async function fetchJson(url, extraHeaders = {}) {
-  const txt = await fetchText(url, extraHeaders);
+async function fetchJson(url, extra = {}) {
+  const txt = await fetchText(url, extra);
   return JSON.parse(txt);
 }
-async function memoJson(url, ttlMs, extraHeaders = {}) {
+async function memoJson(url, ttl, extra = {}) {
   const k = `URL:${url}`;
   const hit = getCache(k); if (hit) return hit;
   try {
-    const j = await fetchJson(url, extraHeaders);
-    if (j) setCache(k, j, ttlMs);
+    const j = await fetchJson(url, extra);
+    if (j) setCache(k, j, ttl);
     return j;
   } catch (e) {
     console.error("fetchJson error:", e.message, "→", url);
@@ -65,27 +66,26 @@ function toMillis(dateStr, timeStr){
   const ms = Date.parse(`${dateStr}T${t}${hasTZ ? "" : "Z"}`);
   return Number.isNaN(ms) ? NaN : ms;
 }
-// Try MANY combos to derive a comparable timestamp
+// derive a comparable timestamp from many possible fields
 function eventMillis(m){
-  // 1) explicit UTC-ish
   let ms = toMillis(m.dateEvent, m.strTime);
   if (!Number.isNaN(ms)) return ms;
-  // 2) local fields
+
   ms = toMillis(m.dateEventLocal || m.dateEvent, m.strTimeLocal || m.strTime);
   if (!Number.isNaN(ms)) return ms;
-  // 3) explicit timestamps
+
   if (m.strTimestampMS) { const n = +m.strTimestampMS; if (!Number.isNaN(n)) return n; }
   if (m.strTimestamp)   { const n = +m.strTimestamp * 1000; if (!Number.isNaN(n)) return n; }
-  // 4) date only
-  if (m.dateEvent) { ms = toMillis(m.dateEvent, "00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
-  if (m.dateEventLocal){ ms = toMillis(m.dateEventLocal, "00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
+
+  if (m.dateEvent)      { ms = toMillis(m.dateEvent, "00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
+  if (m.dateEventLocal) { ms = toMillis(m.dateEventLocal, "00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
+
   return NaN;
 }
-
 function isLiveWord(s=""){ const t=(s+"").toLowerCase(); return t.includes("live")||t.includes("in play")||/^q\d/.test(t)||t.includes("quarter")||t.includes("ot")||t.includes("overtime")||t.includes("half")||t==="ht"; }
 function isFinalWord(s=""){ const t=(s+"").toLowerCase(); return t.includes("final")||t==="ft"||t.includes("full time"); }
 function pickScore(v){ return (v===undefined||v===null||v===""||v==="N/A")?null:v; }
-// Only mark LIVE if status looks live **and** any score exists
+// LIVE only when looks live **and** any score exists
 function normalizeStatus(m,s1,s2){
   const raw=String(m.strStatus||m.strProgress||"").trim();
   const hasScore=(s1!==null)||(s2!==null);
@@ -94,14 +94,6 @@ function normalizeStatus(m,s1,s2){
   if (!raw||raw==="NS"||raw.toLowerCase()==="scheduled"||raw.toLowerCase()==="preview") return "Scheduled";
   return hasScore ? raw : "Scheduled";
 }
-function formatMatch(m){
-  const home=m.strHomeTeam||m.homeTeam||m.strHome||"";
-  const away=m.strAwayTeam||m.awayTeam||m.strAway||"";
-  const s1=pickScore(m.intHomeScore??m.intHomeScoreTotal??m.intHomeScore1??m.intHomeGoals);
-  const s2=pickScore(m.intAwayScore??m.intAwayScoreTotal??m.intAwayScore1??m.intAwayGoals);
-  const status=normalizeStatus(m,s1,s2);
-  return { team1:home, team2:away, score1:s1===null?"N/A":String(s1), score2:s2===null?"N/A":String(s2), headline:`${home} vs ${away} - ${status}` };
-}
 function matchKey(m){ return m.idEvent || `${m.strHomeTeam}|${m.strAwayTeam}|${m.dateEvent||m.dateEventLocal||""}`; }
 function pushUnique(arr,m){ const k=matchKey(m); if (!arr.some(x=>matchKey(x)===k)) arr.push(m); }
 function isOldFinal(m){
@@ -109,14 +101,13 @@ function isOldFinal(m){
   const t=eventMillis(m); if (Number.isNaN(t)) return false;
   return (Date.now()-t) > FINAL_KEEP_MS;
 }
-
-// compute status for sorting
 function computedStatus(m){
   const s1=pickScore(m.intHomeScore??m.intHomeScoreTotal??m.intHomeScore1??m.intHomeGoals);
   const s2=pickScore(m.intAwayScore??m.intAwayScoreTotal??m.intAwayScore1??m.intAwayGoals);
   return normalizeStatus(m, s1, s2);
 }
-// Final comparator: Finals (newest first) → LIVE (by start) → Scheduled (soonest first)
+// Finals (newest first) → LIVE (by start) → Scheduled (soonest first)
+// If a row lacks time, it’s pushed to the end of its group.
 function sortForDisplay(a,b){
   const sa = computedStatus(a), sb = computedStatus(b);
   const pa = (sa==="Final")?0 : (sa==="LIVE")?1 : 2;
@@ -124,17 +115,12 @@ function sortForDisplay(a,b){
   if (pa !== pb) return pa - pb;
 
   const ta = eventMillis(a), tb = eventMillis(b);
-  // If either side lacks a time, push those to the end of the group
   const aBad = !isFinite(ta), bBad = !isFinite(tb);
   if (aBad && !bBad) return +1;
   if (!aBad && bBad) return -1;
 
-  if (pa === 0) { // Finals — newest first
-    if (isFinite(ta) && isFinite(tb)) return tb - ta;
-  } else {       // Live & Scheduled — soonest first
-    if (isFinite(ta) && isFinite(tb)) return ta - tb;
-  }
-  return 0;
+  if (pa === 0) return tb - ta; // Finals newest first
+  return ta - tb;               // Live & Scheduled soonest first
 }
 
 /* ---------------- diagnostics ---------------- */
@@ -177,7 +163,6 @@ async function v1EventsDay(sport, ymd){
 }
 
 /* ---- fill by days until 5 unique (scans weeks forward) ---- */
-function matchKey(m){ return m.idEvent || `${m.strHomeTeam}|${m.strAwayTeam}|${m.dateEvent||m.dateEventLocal||""}`; }
 async function fillByDaysUntilFive(out, sport, leagueId, maxWeeks = 6){
   if (out.length >= 5) return;
   const keys = new Set(out.map(matchKey));
@@ -193,7 +178,7 @@ async function fillByDaysUntilFive(out, sport, leagueId, maxWeeks = 6){
         if (out.length >= 5) break;
         if (String(m.idLeague||"") !== String(leagueId)) continue;
         const ms = eventMillis(m);
-        if (isFinite(ms) && ms < Date.now()) continue;
+        if (isFinite(ms) && ms < Date.now()) continue; // future only
         const k = matchKey(m);
         if (keys.has(k)) continue;
         keys.add(k);
@@ -257,7 +242,7 @@ async function getLeagueMatchesCore(sport, leagueId){
     console.log(`[past v1 recent≤${FINAL_KEEP_MINUTES}m] ${sport} -> ${out.length}`);
   }
 
-  // Final sort for display (Finals→LIVE→Scheduled; then time order within groups)
+  // Final sort for display
   out.sort(sortForDisplay);
 
   return out.slice(0,5);
@@ -269,8 +254,27 @@ async function getLeagueMatchesCached(sport, leagueId){
   const key=`OUT:${sport}:${leagueId}`;
   const hit=getCache(key); if (hit) return hit;
   const data=await getLeagueMatchesCore(sport, leagueId);
-  setCache(key, data, TTL_OUT + Math.floor(Math.random()*5000));
+  setCache(key, data, TTL_OUT + Math.floor(Math.random()*5000)); // jitter
   return data;
+}
+
+/* ---------------- response formatter (now includes start ISO) ---------------- */
+function formatMatch(m){
+  const home = m.strHomeTeam || m.homeTeam || m.strHome || "";
+  const away = m.strAwayTeam || m.awayTeam || m.strAway || "";
+  const s1 = pickScore(m.intHomeScore ?? m.intHomeScoreTotal ?? m.intHomeScore1 ?? m.intHomeGoals);
+  const s2 = pickScore(m.intAwayScore ?? m.intAwayScoreTotal ?? m.intAwayScore1 ?? m.intAwayGoals);
+  const status = normalizeStatus(m, s1, s2);
+  const ms = eventMillis(m);
+
+  return {
+    team1: home,
+    team2: away,
+    score1: s1 === null ? "N/A" : String(s1),
+    score2: s2 === null ? "N/A" : String(s2),
+    headline: `${home} vs ${away} - ${status}`,
+    start: isFinite(ms) ? new Date(ms).toISOString() : null
+  };
 }
 
 /* ---------------- endpoints ---------------- */
