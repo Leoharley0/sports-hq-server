@@ -1,4 +1,4 @@
-// server.js — TSDB-only with robust time parsing + finals expire + season format fallback + /diag
+// server.js — TSDB first, optional ESPN fallback, robust time parsing, finals expire, /diag
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,8 +9,9 @@ if (typeof fetch !== "function") {
 }
 
 // Env (set in Render → Environment, no quotes)
-const V2_KEY = process.env.TSDB_V2_KEY || "";
-const V1_KEY = process.env.TSDB_V1_KEY || "";
+const V2_KEY        = process.env.TSDB_V2_KEY || "";
+const V1_KEY        = process.env.TSDB_V1_KEY || "";
+const FALLBACK_ESPN = process.env.FALLBACK_ESPN === "1"; // optional
 if (!V2_KEY) console.error("❌ Missing TSDB_V2_KEY (required for LIVE)");
 if (!V1_KEY) console.warn("⚠️  TSDB_V1_KEY not set; v1 calls will fail");
 
@@ -27,7 +28,7 @@ async function fetchJson(url, extraHeaders = {}) {
     const res = await fetch(url, { headers: { ...COMMON_HEADERS, ...extraHeaders } });
     if (!res.ok) {
       const body = await res.text();
-      throw new Error(`${res.status} ${res.statusText} | ${body.slice(0,180)}`);
+      throw new Error(`${res.status} ${res.statusText} | ${String(body).slice(0,180)}`);
     }
     return await res.json();
   } catch (e) {
@@ -40,7 +41,7 @@ async function fetchJson(url, extraHeaders = {}) {
 function toMillis(dateEvent, strTime) {
   if (!dateEvent) return NaN;
   const t = (strTime || "00:00:00").trim();
-  const hasTZ = /[zZ]$|[+\-]\d\d:?\d\d$/.test(t);       // already has Z or +hh:mm
+  const hasTZ = /[zZ]$|[+\-]\d\d:?\d\d$/.test(t);  // already Z or +hh:mm
   const iso = `${dateEvent}T${t}${hasTZ ? "" : "Z"}`;
   const ms = Date.parse(iso);
   return Number.isNaN(ms) ? NaN : ms;
@@ -50,14 +51,8 @@ function eventMillis(m) {
     const ms = toMillis(m.dateEvent, m.strTime);
     if (!Number.isNaN(ms)) return ms;
   }
-  if (m.strTimestampMS) {
-    const n = Number(m.strTimestampMS);
-    if (!Number.isNaN(n)) return n;
-  }
-  if (m.strTimestamp) {
-    const n = Number(m.strTimestamp) * 1000;
-    if (!Number.isNaN(n)) return n;
-  }
+  if (m.strTimestampMS) { const n = Number(m.strTimestampMS); if (!Number.isNaN(n)) return n; }
+  if (m.strTimestamp)   { const n = Number(m.strTimestamp)*1000; if (!Number.isNaN(n)) return n; }
   return NaN;
 }
 function isLiveWord(s = "") {
@@ -72,7 +67,7 @@ function isFinalWord(s = "") {
   return t.includes("final") || t === "ft" || t.includes("full time");
 }
 function pickScore(v) { return (v === undefined || v === null || v === "" || v === "N/A") ? null : v; }
-// Only mark LIVE when status looks live **and** any score exists
+// Only mark LIVE when looks live **and** any score exists
 function normalizeStatus(m, s1, s2) {
   const raw = String(m.strStatus || m.strProgress || "").trim();
   const hasScore = (s1 !== null) || (s2 !== null);
@@ -98,7 +93,7 @@ function isOldFinal(m) {
   const raw = m.strStatus || m.strProgress || "";
   if (!isFinalWord(raw)) return false;
   const t = eventMillis(m);
-  if (Number.isNaN(t)) return false;              // unknown -> keep briefly
+  if (Number.isNaN(t)) return false; // unknown -> keep briefly
   return (Date.now() - t) > FINAL_KEEP_MS;
 }
 
@@ -121,14 +116,14 @@ app.get("/diag", async (_, res) => {
   const season = guessSeasonCrossYear();
   const v2h = { "X-API-KEY": V2_KEY };
   const checks = [];
-  checks.push({ env: { node: process.version, hasV2Key: !!V2_KEY, v2KeyLen: (V2_KEY||"").length, hasV1Key: !!V1_KEY, v1Key: V1_KEY }});
+  checks.push({ env: { node: process.version, hasV2Key: !!V2_KEY, v2KeyLen: (V2_KEY||"").length, hasV1Key: !!V1_KEY, v1Key: V1_KEY, FALLBACK_ESPN }});
   checks.push(await probe(`https://www.thesportsdb.com/api/v2/json/livescore/soccer`, v2h));
   for (const [_, id] of [["NBA",4387], ["NHL",4380], ["EPL",4328], ["NFL",4391]]) {
     checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${id}`));
     checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsseason.php?id=${id}&s=${encodeURIComponent(season)}`));
     checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventspastleague.php?id=${id}`));
   }
-  res.json({ ok:true, seasonCross: season, FINAL_KEEP_MINUTES, checks });
+  res.json({ ok:true, seasonCross: season, FINAL_KEEP_MINUTES, FALLBACK_ESPN, checks });
 });
 
 /* ---------------- TSDB fetchers ---------------- */
@@ -160,17 +155,51 @@ async function v1PastLeague(leagueId) {
   return Array.isArray(j?.events) ? j.events : [];
 }
 
-/* ---------------- season format candidates by league ---------------- */
+/* ---------------- ESPN fallback (optional) ---------------- */
+// Only used when TSDB returns < 5 and FALLBACK_ESPN=1
+async function espnDay(sportPath, yyyymmdd) {
+  const url = `https://site.api.espn.com/apis/site/v2/sports/${sportPath}/scoreboard?dates=${yyyymmdd}`;
+  const j = await fetchJson(url);
+  return Array.isArray(j?.events) ? j.events : [];
+}
+function espnStatus(e) {
+  const st = e?.status?.type?.state || ""; // 'pre' | 'in' | 'post' | 'in'
+  if (st === "in") return "LIVE";
+  if (st === "post") return "Final";
+  return "Scheduled";
+}
+async function espnUpcoming(sportPath, daysAhead, limit) {
+  const out = [];
+  const today = new Date();
+  for (let d = 0; d < daysAhead && out.length < limit; d++) {
+    const dt = new Date(today.getTime() + d*86400000);
+    const yyyymmdd = dt.toISOString().slice(0,10).replace(/-/g,"");
+    const events = await espnDay(sportPath, yyyymmdd);
+    for (const e of events) {
+      if (out.length >= limit) break;
+      const comp = e?.competitions?.[0]; if (!comp) continue;
+      const teams = comp.competitors || [];
+      const home = teams.find(t => t.homeAway === "home")?.team?.displayName;
+      const away = teams.find(t => t.homeAway === "away")?.team?.displayName;
+      if (!home || !away) continue;
+      const status = espnStatus(e);
+      if (status !== "Scheduled") continue; // we only use this to fill scheduled rows
+      out.push({ team1: home, team2: away, score1: "N/A", score2: "N/A", headline: `${home} vs ${away} - Scheduled` });
+    }
+  }
+  return out.slice(0, limit);
+}
+
+/* ---------------- season format candidates by league (TSDB) ---------------- */
 function seasonCandidates(sport, leagueId) {
   const d = new Date();
   const y = d.getUTCFullYear();
-  const cross = guessSeasonCrossYear();       // e.g. "2025-2026"
+  const cross = guessSeasonCrossYear();       // "2025-2026"
   const crossPrev = `${y-1}-${y}`;
   const single = String(y);
   const singlePrev = String(y - 1);
 
-  // NFL tends to be single-year; NBA/NHL/EPL tend to be cross-year
-  if (leagueId === 4391 || sport === "american_football") {
+  if (leagueId === 4391 || sport === "american_football") { // NFL
     return [single, singlePrev, cross, crossPrev];
   }
   if (leagueId === 4387 || leagueId === 4380) { // NBA / NHL
@@ -182,7 +211,7 @@ function seasonCandidates(sport, leagueId) {
   return [cross, single, crossPrev, singlePrev];
 }
 
-/* ---------------- builder: LIVE → NEXT → SEASON (future) → PAST (recent) ---------------- */
+/* ---------------- builder: LIVE → NEXT → SEASON (future) → PAST (recent) + ESPN fill ---------------- */
 async function getLeagueMatches(sport, leagueId) {
   const out = [];
 
@@ -231,6 +260,28 @@ async function getLeagueMatches(sport, leagueId) {
       pushUnique(out, m);
     }
     console.log(`[past v1 recent≤${FINAL_KEEP_MINUTES}m] ${sport} -> ${out.length}`);
+  }
+
+  // 5) ESPN fallback (scheduled only) — optional
+  if (FALLBACK_ESPN && out.length < 5) {
+    let rows = [];
+    if (leagueId === 4391)       rows = await espnUpcoming("american-football/nfl", 90, 10);
+    else if (leagueId === 4387)  rows = await espnUpcoming("basketball/nba", 120, 10);
+    else if (leagueId === 4380)  rows = await espnUpcoming("hockey/nhl", 120, 10);
+
+    for (const r of rows) {
+      if (out.length >= 5) break;
+      // ESPN rows are already formatted; just push if not dup
+      pushUnique(out, {
+        idEvent: undefined,
+        strHomeTeam: r.team1,
+        strAwayTeam: r.team2,
+        dateEvent: undefined,
+        strTime: "",
+        strStatus: "Scheduled"
+      });
+    }
+    console.log(`[espn fill] ${sport} -> ${out.length}`);
   }
 
   return out.slice(0, 5);
