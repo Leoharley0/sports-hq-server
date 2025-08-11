@@ -1,5 +1,5 @@
-// server.js — TSDB-only with caching + robust day-fill (scans forward until 5 unique)
-// LIVE only if scores, finals expire after 15m, /diag included.
+// server.js — TSDB-only with caching + robust day-fill + explicit sort order
+// Order: recent Finals (≤15m) → LIVE → Scheduled (soonest first)
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -92,6 +92,30 @@ function isOldFinal(m){
   return (Date.now()-t) > FINAL_KEEP_MS;
 }
 
+// compute status for sorting
+function computedStatus(m){
+  const s1=pickScore(m.intHomeScore??m.intHomeScoreTotal??m.intHomeScore1??m.intHomeGoals);
+  const s2=pickScore(m.intAwayScore??m.intAwayScoreTotal??m.intAwayScore1??m.intAwayGoals);
+  return normalizeStatus(m, s1, s2);
+}
+// final comparator: Finals (newest first) → LIVE (by start) → Scheduled (soonest first)
+function sortForDisplay(a,b){
+  const sa = computedStatus(a), sb = computedStatus(b);
+  const pa = (sa==="Final")?0 : (sa==="LIVE")?1 : 2;
+  const pb = (sb==="Final")?0 : (sb==="LIVE")?1 : 2;
+  if (pa !== pb) return pa - pb;
+
+  const ta = eventMillis(a), tb = eventMillis(b);
+  if (pa === 0) { // Finals — newest first
+    if (isFinite(ta) && isFinite(tb)) return tb - ta;
+  } else if (pa === 1) { // Live — older start first (optional; keeps stable)
+    if (isFinite(ta) && isFinite(tb)) return ta - tb;
+  } else { // Scheduled — soonest first
+    if (isFinite(ta) && isFinite(tb)) return ta - tb;
+  }
+  return 0;
+}
+
 /* ---------------- diagnostics ---------------- */
 function guessSeasonCrossYear(){ const d=new Date(), y=d.getUTCFullYear(), m=d.getUTCMonth()+1, s=(m>=7)?y:y-1; return `${s}-${s+1}`; }
 async function probe(url, extra={}){ try{ const t=await fetchText(url, extra); return {ok:true,status:200,url,preview:t.slice(0,160)}; }catch(e){ return {ok:false,status:0,url,error:String(e)}; } }
@@ -131,7 +155,6 @@ async function v1EventsDay(sport, ymd){
   return Array.isArray(j?.events)?j.events:[];
 }
 
-/* ---- NEW: fill by days until 5 unique (scans weeks forward, skips dups vs OUT) ---- */
 async function fillByDaysUntilFive(out, sport, leagueId, maxWeeks = 6){
   if (out.length >= 5) return;
   const keys = new Set(out.map(matchKey));
@@ -142,14 +165,14 @@ async function fillByDaysUntilFive(out, sport, leagueId, maxWeeks = 6){
     for (let d = start; d < end && out.length < 5; d++){
       const dt = new Date(today.getTime() + d*86400000);
       const ymd = dt.toISOString().slice(0,10);
-      const rows = await v1EventsDay(sport, ymd); // memoized 30m
+      const rows = await v1EventsDay(sport, ymd);
       for (const m of rows){
         if (out.length >= 5) break;
         if (String(m.idLeague||"") !== String(leagueId)) continue;
         const ms = toMillis(m.dateEvent, m.strTime);
-        if (isFinite(ms) && ms < Date.now()) continue;      // future only
+        if (isFinite(ms) && ms < Date.now()) continue;
         const k = matchKey(m);
-        if (keys.has(k)) continue;                           // skip duplicates
+        if (keys.has(k)) continue;
         keys.add(k);
         out.push(m);
       }
@@ -211,15 +234,19 @@ async function getLeagueMatchesCore(sport, leagueId){
     console.log(`[past v1 recent≤${FINAL_KEEP_MINUTES}m] ${sport} -> ${out.length}`);
   }
 
+  // >>> NEW: final sort for display <<<
+  out.sort(sortForDisplay);
+
   return out.slice(0,5);
 }
 
 // small cache for final per-league response
+const TTL_OUT = 25*1000;
 async function getLeagueMatchesCached(sport, leagueId){
   const key=`OUT:${sport}:${leagueId}`;
   const hit=getCache(key); if (hit) return hit;
   const data=await getLeagueMatchesCore(sport, leagueId);
-  setCache(key, data, TTL.OUT + Math.floor(Math.random()*5000));
+  setCache(key, data, TTL_OUT + Math.floor(Math.random()*5000));
   return data;
 }
 
