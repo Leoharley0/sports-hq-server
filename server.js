@@ -1,4 +1,4 @@
-// server.js — TSDB-only (v2 LIVE + v1 NEXT/SEASON/PAST) with /diag
+// server.js — TSDB-only with "hide finals after 15 min" + /diag
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,10 +14,10 @@ if (typeof fetch !== "function") {
 const V2_KEY = process.env.TSDB_V2_KEY || "";
 const V1_KEY = process.env.TSDB_V1_KEY || "";
 
-if (!V2_KEY) console.error("❌ Missing TSDB_V2_KEY (required for LIVE).");
-if (!V1_KEY) console.warn("⚠️  TSDB_V1_KEY not set; v1 calls will fail.");
+// How long a finished game is allowed to remain visible
+const FINAL_KEEP_MINUTES = 15;
+const FINAL_KEEP_MS = FINAL_KEEP_MINUTES * 60 * 1000;
 
-// Headers to avoid CDN HTML responses
 const COMMON_HEADERS = {
   "User-Agent": "SportsHQ/1.0 (+render.com)",
   "Accept": "application/json",
@@ -37,7 +37,7 @@ async function fetchJson(url, extraHeaders = {}) {
   }
 }
 
-/* ---------------- helpers: status & formatting ---------------- */
+/* ---------------- helpers: status, time & formatting ---------------- */
 
 function isLiveWord(s = "") {
   const t = (s + "").toLowerCase();
@@ -51,22 +51,38 @@ function isFinalWord(s = "") {
   return t.includes("final") || t === "ft" || t.includes("full time");
 }
 function pickScore(v) {
-  // keep 0; null out empty/NA
   return (v === undefined || v === null || v === "" || v === "N/A") ? null : v;
 }
 
-// NEW: only mark LIVE when status looks live **and** at least one score exists
+// Try to get an event UTC timestamp for filtering finals
+function eventMillis(m) {
+  // Most v1 events have dateEvent + strTime (UTC or Z-suffixed)
+  if (m.dateEvent) {
+    const time = (m.strTime || "00:00:00").replace(" ", "");
+    const ts = Date.parse(`${m.dateEvent}T${time}Z`);
+    if (!Number.isNaN(ts)) return ts;
+  }
+  // Sometimes livescore includes strTimestamp (unix seconds) or strTimestampMS
+  if (m.strTimestampMS) {
+    const n = Number(m.strTimestampMS);
+    if (!Number.isNaN(n)) return n;
+  }
+  if (m.strTimestamp) {
+    const n = Number(m.strTimestamp) * 1000;
+    if (!Number.isNaN(n)) return n;
+  }
+  return NaN; // unknown
+}
+
+// Only mark LIVE when status looks live **and** any score exists
 function normalizeStatus(m, s1, s2) {
   const raw = String(m.strStatus || m.strProgress || "").trim();
   const hasScore = (s1 !== null) || (s2 !== null);
 
   if (isFinalWord(raw)) return "Final";
   if (isLiveWord(raw))  return hasScore ? "LIVE" : "Scheduled";
-
   if (!raw || raw === "NS" || raw.toLowerCase() === "scheduled" || raw.toLowerCase() === "preview")
     return "Scheduled";
-
-  // if ambiguous and no score yet, be conservative
   return hasScore ? raw : "Scheduled";
 }
 
@@ -119,12 +135,12 @@ app.get("/diag", async (_, res) => {
   const checks = [];
   checks.push({ env: { node: process.version, hasV2Key: !!V2_KEY, v2KeyLen: (V2_KEY||"").length, hasV1Key: !!V1_KEY, v1Key: V1_KEY }});
   checks.push(await probe(`https://www.thesportsdb.com/api/v2/json/livescore/soccer`, v2h));
-  for (const [name, id] of [["NBA",4387], ["NHL",4380], ["EPL",4328]]) {
+  for (const [_, id] of [["NBA",4387], ["NHL",4380], ["EPL",4328]]) {
     checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${id}`));
     checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsseason.php?id=${id}&s=${encodeURIComponent(season)}`));
     checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventspastleague.php?id=${id}`));
   }
-  res.json({ ok:true, season, checks });
+  res.json({ ok:true, season, FINAL_KEEP_MINUTES, checks });
 });
 
 /* ---------------- TSDB fetchers ---------------- */
@@ -158,17 +174,29 @@ async function v1PastLeague(leagueId) {
   return Array.isArray(j?.events) ? j.events : [];
 }
 
-/* ---------------- builder: LIVE → NEXT → SEASON → PAST ---------------- */
+/* ---------------- builder: LIVE → NEXT → SEASON → (recent) PAST ---------------- */
+
+function isOldFinal(m) {
+  const raw = m.strStatus || m.strProgress || "";
+  if (!isFinalWord(raw)) return false;
+  const t = eventMillis(m);
+  if (Number.isNaN(t)) return false;               // can't tell => keep (better to show briefly)
+  return (Date.now() - t) > FINAL_KEEP_MS;         // older than window => hide
+}
 
 async function getLeagueMatches(sport, leagueId) {
   const out = [];
 
-  // LIVE
+  // 1) LIVE (filter out finals older than window just in case)
   const live = await v2Livescore(sport);
-  for (const m of live || []) if (String(m.idLeague || "") === String(leagueId)) pushUnique(out, m);
+  for (const m of live || []) {
+    if (String(m.idLeague || "") !== String(leagueId)) continue;
+    if (isOldFinal(m)) continue;
+    pushUnique(out, m);
+  }
   console.log(`[live] ${sport} league=${leagueId} -> ${out.length}`);
 
-  // NEXT
+  // 2) NEXT (upcoming)
   if (out.length < 5) {
     const e = await v1NextLeague(leagueId);
     e.sort((a,b) =>
@@ -179,7 +207,7 @@ async function getLeagueMatches(sport, leagueId) {
     console.log(`[next v1] ${sport} -> ${out.length}`);
   }
 
-  // SEASON (future only; catches preseason if present)
+  // 3) SEASON (future only; catches preseason if present)
   if (out.length < 5) {
     const season = guessSeasonString();
     const e = await v1Season(leagueId, season);
@@ -195,7 +223,7 @@ async function getLeagueMatches(sport, leagueId) {
     console.log(`[season v1 ${season}] ${sport} -> ${out.length}`);
   }
 
-  // PAST finals
+  // 4) PAST finals — but ONLY very recent (≤ FINAL_KEEP_MS)
   if (out.length < 5) {
     const e = await v1PastLeague(leagueId);
     e.sort((a,b) =>
@@ -205,9 +233,10 @@ async function getLeagueMatches(sport, leagueId) {
     for (const m of e) {
       if (out.length >= 5) break;
       m.strStatus = m.strStatus || "Final";
+      if (isOldFinal(m)) continue; // skip if older than window
       pushUnique(out, m);
     }
-    console.log(`[past v1] ${sport} -> ${out.length}`);
+    console.log(`[past v1 recent≤${FINAL_KEEP_MINUTES}m] ${sport} -> ${out.length}`);
   }
 
   return out.slice(0, 5);
