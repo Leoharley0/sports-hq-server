@@ -6,6 +6,9 @@ const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+const BUILD = "start-field+sorting v3 - 2025-08-11T"; // any string you like
+app.get("/version", (_, res) => res.json({ build: BUILD }));
+
 // Polyfill fetch for older Node runtimes
 if (typeof fetch !== "function") {
   global.fetch = (...args) => import("node-fetch").then(m => m.default(...args));
@@ -265,7 +268,7 @@ function formatMatch(m){
   const s1 = pickScore(m.intHomeScore ?? m.intHomeScoreTotal ?? m.intHomeScore1 ?? m.intHomeGoals);
   const s2 = pickScore(m.intAwayScore ?? m.intAwayScoreTotal ?? m.intAwayScore1 ?? m.intAwayGoals);
   const status = normalizeStatus(m, s1, s2);
-  const ms = eventMillis(m);
+  const ms = eventMillis(m);                   // <- uses all fields incl. local
 
   return {
     team1: home,
@@ -273,7 +276,7 @@ function formatMatch(m){
     score1: s1 === null ? "N/A" : String(s1),
     score2: s2 === null ? "N/A" : String(s2),
     headline: `${home} vs ${away} - ${status}`,
-    start: isFinite(ms) ? new Date(ms).toISOString() : null
+    start: isFinite(ms) ? new Date(ms).toISOString() : null   // <- this field
   };
 }
 
