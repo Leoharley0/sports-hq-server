@@ -1,4 +1,4 @@
-// server.js — TSDB-only: LIVE (v2) + NEXT/SEASON/DAY/P AST (v1) + finals expire + /diag
+// server.js — TSDB-only with caching + throttled day-scan + finals expire + /diag
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -8,7 +8,7 @@ if (typeof fetch !== "function") {
   global.fetch = (...args) => import("node-fetch").then(m => m.default(...args));
 }
 
-// Env (set in Render → Environment, no quotes)
+// Env (Render → Environment)
 const V2_KEY = process.env.TSDB_V2_KEY || "";
 const V1_KEY = process.env.TSDB_V1_KEY || "";
 if (!V2_KEY) console.error("❌ Missing TSDB_V2_KEY (required for LIVE)");
@@ -21,15 +21,37 @@ const COMMON_HEADERS = { "User-Agent": "SportsHQ/1.0 (+render.com)", "Accept": "
 const FINAL_KEEP_MINUTES = 15;
 const FINAL_KEEP_MS = FINAL_KEEP_MINUTES * 60 * 1000;
 
-/* ---------------- fetch helper ---------------- */
+/* ---------------- simple in-memory cache ---------------- */
+const cache = new Map();
+function getCache(k) {
+  const v = cache.get(k);
+  if (v && v.exp > Date.now()) return v.val;
+  if (v) cache.delete(k);
+  return null;
+}
+function setCache(k, val, ttlMs) {
+  cache.set(k, { val, exp: Date.now() + ttlMs });
+}
+
+/* ---------------- fetch helpers (with memo) ---------------- */
+async function fetchText(url, extraHeaders = {}) {
+  const res = await fetch(url, { headers: { ...COMMON_HEADERS, ...extraHeaders } });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText} | ${text.slice(0,180)}`);
+  return text;
+}
 async function fetchJson(url, extraHeaders = {}) {
+  const txt = await fetchText(url, extraHeaders);
+  return JSON.parse(txt);
+}
+async function memoJson(url, ttlMs, extraHeaders = {}) {
+  const k = `URL:${url}`;
+  const hit = getCache(k);
+  if (hit) return hit;
   try {
-    const res = await fetch(url, { headers: { ...COMMON_HEADERS, ...extraHeaders } });
-    if (!res.ok) {
-      const body = await res.text();
-      throw new Error(`${res.status} ${res.statusText} | ${String(body).slice(0,180)}`);
-    }
-    return await res.json();
+    const j = await fetchJson(url, extraHeaders);
+    if (j) setCache(k, j, ttlMs);
+    return j;
   } catch (e) {
     console.error("fetchJson error:", e.message, "→", url);
     return null;
@@ -40,7 +62,7 @@ async function fetchJson(url, extraHeaders = {}) {
 function toMillis(dateEvent, strTime) {
   if (!dateEvent) return NaN;
   const t = (strTime || "00:00:00").trim();
-  const hasTZ = /[zZ]$|[+\-]\d\d:?\d\d$/.test(t);  // already Z or +hh:mm
+  const hasTZ = /[zZ]$|[+\-]\d\d:?\d\d$/.test(t);
   const iso = `${dateEvent}T${t}${hasTZ ? "" : "Z"}`;
   const ms = Date.parse(iso);
   return Number.isNaN(ms) ? NaN : ms;
@@ -51,7 +73,7 @@ function eventMillis(m) {
     if (!Number.isNaN(ms)) return ms;
   }
   if (m.strTimestampMS) { const n = Number(m.strTimestampMS); if (!Number.isNaN(n)) return n; }
-  if (m.strTimestamp)   { const n = Number(m.strTimestamp)*1000; if (!Number.isNaN(n)) return n; }
+  if (m.strTimestamp)   { const n = Number(m.strTimestamp) * 1000; if (!Number.isNaN(n)) return n; }
   return NaN;
 }
 function isLiveWord(s = "") {
@@ -66,7 +88,7 @@ function isFinalWord(s = "") {
   return t.includes("final") || t === "ft" || t.includes("full time");
 }
 function pickScore(v) { return (v === undefined || v === null || v === "" || v === "N/A") ? null : v; }
-// Only mark LIVE when looks live **and** any score exists
+// Only mark LIVE if status looks live **and** any score exists
 function normalizeStatus(m, s1, s2) {
   const raw = String(m.strStatus || m.strProgress || "").trim();
   const hasScore = (s1 !== null) || (s2 !== null);
@@ -91,16 +113,15 @@ function isOldFinal(m) {
   const raw = m.strStatus || m.strProgress || "";
   if (!isFinalWord(raw)) return false;
   const t = eventMillis(m);
-  if (Number.isNaN(t)) return false;              // unknown -> keep briefly
+  if (Number.isNaN(t)) return false; // unknown -> keep briefly
   return (Date.now() - t) > FINAL_KEEP_MS;
 }
 
 /* ---------------- diagnostics ---------------- */
 async function probe(url, extraHeaders = {}) {
   try {
-    const res = await fetch(url, { headers: { ...COMMON_HEADERS, ...extraHeaders } });
-    const text = await res.text();
-    return { ok: res.ok, status: res.status, url, preview: text.slice(0,160) };
+    const txt = await fetchText(url, extraHeaders);
+    return { ok: true, status: 200, url, preview: String(txt).slice(0,160) };
   } catch (e) {
     return { ok: false, status: 0, url, error: String(e) };
   }
@@ -119,13 +140,21 @@ app.get("/diag", async (_, res) => {
   for (const [_, id] of [["NBA",4387], ["NHL",4380], ["EPL",4328], ["NFL",4391]]) {
     checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${id}`));
     checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsseason.php?id=${id}&s=${encodeURIComponent(season)}`));
-    // today eventsday by sport (see below) for visibility
-    checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsday.php?d=${new Date().toISOString().slice(0,10)}&s=American%20Football`));
   }
-  res.json({ ok:true, seasonCross: season, FINAL_KEEP_MINUTES, checks });
+  res.json({ ok:true, seasonCross: season, FINAL_KEEP_MINUTES, checks, cacheKeys: cache.size });
 });
 
-/* ---------------- TSDB fetchers ---------------- */
+/* ---------------- TSDB fetchers (memoized) ---------------- */
+// TTLs
+const TTL = {
+  LIVE:   15 * 1000,
+  NEXT:    5 * 60 * 1000,
+  SEASON:  3 * 60 * 60 * 1000,
+  DAY:    30 * 60 * 1000,
+  PAST:   10 * 60 * 1000,
+  OUT:     25 * 1000, // final per-league response
+};
+
 // v2 LIVE
 async function v2Livescore(sport) {
   const s = sport.replace(/_/g, " ");
@@ -135,79 +164,88 @@ async function v2Livescore(sport) {
   ];
   const out = [];
   for (const u of urls) {
-    const j = await fetchJson(u, { "X-API-KEY": V2_KEY });
+    const j = await memoJson(u, TTL.LIVE, { "X-API-KEY": V2_KEY });
     if (j?.livescore?.length) out.push(...j.livescore);
   }
   return out;
 }
+
 // v1 NEXT/SEASON/PAST
 async function v1NextLeague(leagueId) {
-  const j = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${leagueId}`);
+  const url = `https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${leagueId}`;
+  const j = await memoJson(url, TTL.NEXT);
   return Array.isArray(j?.events) ? j.events : [];
 }
 async function v1Season(leagueId, season) {
-  const j = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsseason.php?id=${leagueId}&s=${encodeURIComponent(season)}`);
+  const url = `https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsseason.php?id=${leagueId}&s=${encodeURIComponent(season)}`;
+  const j = await memoJson(url, TTL.SEASON);
   return Array.isArray(j?.events) ? j.events : [];
 }
 async function v1PastLeague(leagueId) {
-  const j = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventspastleague.php?id=${leagueId}`);
+  const url = `https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventspastleague.php?id=${leagueId}`;
+  const j = await memoJson(url, TTL.PAST);
   return Array.isArray(j?.events) ? j.events : [];
 }
 
-/* ---------------- NEW: v1 eventsday (by sport) upcoming ---------------- */
+// v1 eventsday scan (memoized per day & sport)
 const SPORT_LABEL = {
   soccer: "Soccer",
   basketball: "Basketball",
   american_football: "American Football",
   ice_hockey: "Ice Hockey",
 };
-
-async function v1UpcomingByDays(sport, leagueId, daysAhead = 21, limit = 10) {
+async function v1EventsDay(sport, ymd) {
   const label = SPORT_LABEL[sport] || sport;
-  const out = [];
-  const today = new Date();
-  for (let d = 0; d < daysAhead && out.length < limit; d++) {
-    const dt = new Date(today.getTime() + d * 86400000);
-    const ymd = dt.toISOString().slice(0, 10);
-    const j = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsday.php?d=${ymd}&s=${encodeURIComponent(label)}`);
-    const rows = Array.isArray(j?.events) ? j.events : [];
-    for (const m of rows) {
-      if (out.length >= limit) break;
-      if (String(m.idLeague || "") !== String(leagueId)) continue;
-      // future only (or same day later)
-      const ms = toMillis(m.dateEvent, m.strTime);
-      if (isFinite(ms) && ms < Date.now()) continue;
-      pushUnique(out, m);
-    }
-  }
-  // sort ascending just in case multiple days mixed
-  out.sort((a,b) => toMillis(a.dateEvent, a.strTime) - toMillis(b.dateEvent, b.strTime));
-  return out.slice(0, limit);
+  const url = `https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsday.php?d=${ymd}&s=${encodeURIComponent(label)}`;
+  const j = await memoJson(url, TTL.DAY);
+  return Array.isArray(j?.events) ? j.events : [];
 }
 
-/* ---------------- season format candidates by league ---------------- */
+// Progressive day-scan bands to avoid 429s
+async function v1UpcomingByDaysThrottled(sport, leagueId, need) {
+  const out = [];
+  const today = new Date();
+  const bands = [[0,7], [7,14], [14,21]];
+  for (const [start, end] of bands) {
+    if (out.length >= need) break;
+    for (let d = start; d < end && out.length < need; d++) {
+      const dt = new Date(today.getTime() + d * 86400000);
+      const ymd = dt.toISOString().slice(0,10);
+      const rows = await v1EventsDay(sport, ymd); // memoized 30m
+      for (const m of rows) {
+        if (out.length >= need) break;
+        if (String(m.idLeague || "") !== String(leagueId)) continue;
+        const ms = toMillis(m.dateEvent, m.strTime);
+        if (isFinite(ms) && ms < Date.now()) continue;
+        pushUnique(out, m);
+      }
+    }
+  }
+  // sort ascending
+  out.sort((a,b) => toMillis(a.dateEvent, a.strTime) - toMillis(b.dateEvent, b.strTime));
+  return out.slice(0, need);
+}
+
+/* ---------------- season format candidates ---------------- */
+function guessSeasonCrossYear() {
+  const d = new Date(); const y = d.getUTCFullYear(); const m = d.getUTCMonth()+1;
+  const start = (m >= 7) ? y : (y - 1);
+  return `${start}-${start+1}`;
+}
 function seasonCandidates(sport, leagueId) {
-  const d = new Date();
-  const y = d.getUTCFullYear();
-  const cross = guessSeasonCrossYear();       // "2025-2026"
+  const d = new Date(); const y = d.getUTCFullYear();
+  const cross = guessSeasonCrossYear();
   const crossPrev = `${y-1}-${y}`;
   const single = String(y);
   const singlePrev = String(y - 1);
-
-  if (leagueId === 4391 || sport === "american_football") { // NFL
-    return [single, singlePrev, cross, crossPrev];
-  }
-  if (leagueId === 4387 || leagueId === 4380) { // NBA / NHL
-    return [cross, crossPrev, single, singlePrev];
-  }
-  if (leagueId === 4328) { // EPL
-    return [cross, crossPrev];
-  }
+  if (leagueId === 4391 || sport === "american_football") return [single, singlePrev, cross, crossPrev];
+  if (leagueId === 4387 || leagueId === 4380) return [cross, crossPrev, single, singlePrev];
+  if (leagueId === 4328) return [cross, crossPrev];
   return [cross, single, crossPrev, singlePrev];
 }
 
 /* ---------------- builder: LIVE → NEXT → SEASON → DAY → PAST ---------------- */
-async function getLeagueMatches(sport, leagueId) {
+async function getLeagueMatchesCore(sport, leagueId) {
   const out = [];
 
   // 1) LIVE
@@ -219,7 +257,7 @@ async function getLeagueMatches(sport, leagueId) {
   }
   console.log(`[live] ${sport} league=${leagueId} -> ${out.length}`);
 
-  // 2) NEXT (upcoming)
+  // 2) NEXT
   if (out.length < 5) {
     const e = await v1NextLeague(leagueId);
     e.sort((a,b) => toMillis(a.dateEvent, a.strTime) - toMillis(b.dateEvent, b.strTime));
@@ -227,7 +265,7 @@ async function getLeagueMatches(sport, leagueId) {
     console.log(`[next v1] ${sport} -> ${out.length}`);
   }
 
-  // 3) SEASON (future only; try multiple season formats)
+  // 3) SEASON (future only; try multiple formats)
   if (out.length < 5) {
     const tried = [];
     for (const s of seasonCandidates(sport, leagueId)) {
@@ -244,14 +282,15 @@ async function getLeagueMatches(sport, leagueId) {
     }
   }
 
-  // 4) DAY (by sport) — scan next ~3 weeks to fill Scheduled games
+  // 4) DAY scan (TSDB-only; memoized; throttled)
   if (out.length < 5) {
-    const add = await v1UpcomingByDays(sport, leagueId, 21, 10);
+    const need = 5 - out.length;
+    const add = await v1UpcomingByDaysThrottled(sport, leagueId, need);
     for (const m of add) { if (out.length >= 5) break; pushUnique(out, m); }
     console.log(`[day v1 scan] ${sport} -> ${out.length}`);
   }
 
-  // 5) PAST (only very recent finals ≤ 15m) — last resort
+  // 5) PAST (very recent finals ≤ 15m)
   if (out.length < 5) {
     const e = await v1PastLeague(leagueId);
     e.sort((a,b) => toMillis(b.dateEvent, b.strTime) - toMillis(a.dateEvent, a.strTime));
@@ -267,6 +306,16 @@ async function getLeagueMatches(sport, leagueId) {
   return out.slice(0, 5);
 }
 
+// Small cache for final per-league response to cut burst traffic
+async function getLeagueMatchesCached(sport, leagueId) {
+  const key = `OUT:${sport}:${leagueId}`;
+  const hit = getCache(key);
+  if (hit) return hit;
+  const data = await getLeagueMatchesCore(sport, leagueId);
+  setCache(key, data, TTL.OUT + Math.floor(Math.random()*5000)); // add jitter
+  return data;
+}
+
 /* ---------------- endpoints ---------------- */
 const CONFIGS = {
   "/scores/soccer": { sport: "soccer",            leagueId: 4328 },
@@ -278,7 +327,7 @@ const CONFIGS = {
 for (const [path, cfg] of Object.entries(CONFIGS)) {
   app.get(path, async (req, res) => {
     try {
-      const items = await getLeagueMatches(cfg.sport, cfg.leagueId);
+      const items = await getLeagueMatchesCached(cfg.sport, cfg.leagueId);
       console.log(`${path} → ${items.length} items`);
       res.json(items.map(formatMatch));
     } catch (e) {
