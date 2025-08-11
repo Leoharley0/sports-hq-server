@@ -1,4 +1,4 @@
-// server.js — TSDB-only with robust time parsing + finals expire + /diag
+// server.js — TSDB-only with robust time parsing + finals expire + season format fallback + /diag
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,10 +15,7 @@ if (!V2_KEY) console.error("❌ Missing TSDB_V2_KEY (required for LIVE)");
 if (!V1_KEY) console.warn("⚠️  TSDB_V1_KEY not set; v1 calls will fail");
 
 // Keep CDNs happy
-const COMMON_HEADERS = {
-  "User-Agent": "SportsHQ/1.0 (+render.com)",
-  "Accept": "application/json",
-};
+const COMMON_HEADERS = { "User-Agent": "SportsHQ/1.0 (+render.com)", "Accept": "application/json" };
 
 // Finals visibility window
 const FINAL_KEEP_MINUTES = 15;
@@ -43,13 +40,11 @@ async function fetchJson(url, extraHeaders = {}) {
 function toMillis(dateEvent, strTime) {
   if (!dateEvent) return NaN;
   const t = (strTime || "00:00:00").trim();
-  // if time already has Z or +/-HH:MM, don't append Z
-  const hasTZ = /[zZ]$|[+\-]\d\d:?\d\d$/.test(t);
+  const hasTZ = /[zZ]$|[+\-]\d\d:?\d\d$/.test(t);       // already has Z or +hh:mm
   const iso = `${dateEvent}T${t}${hasTZ ? "" : "Z"}`;
   const ms = Date.parse(iso);
   return Number.isNaN(ms) ? NaN : ms;
 }
-
 function eventMillis(m) {
   if (m.dateEvent) {
     const ms = toMillis(m.dateEvent, m.strTime);
@@ -65,7 +60,6 @@ function eventMillis(m) {
   }
   return NaN;
 }
-
 function isLiveWord(s = "") {
   const t = (s + "").toLowerCase();
   return t.includes("live") || t.includes("in play") ||
@@ -77,54 +71,34 @@ function isFinalWord(s = "") {
   const t = (s + "").toLowerCase();
   return t.includes("final") || t === "ft" || t.includes("full time");
 }
-function pickScore(v) {
-  return (v === undefined || v === null || v === "" || v === "N/A") ? null : v;
-}
-
+function pickScore(v) { return (v === undefined || v === null || v === "" || v === "N/A") ? null : v; }
 // Only mark LIVE when status looks live **and** any score exists
 function normalizeStatus(m, s1, s2) {
   const raw = String(m.strStatus || m.strProgress || "").trim();
   const hasScore = (s1 !== null) || (s2 !== null);
-
   if (isFinalWord(raw)) return "Final";
   if (isLiveWord(raw))  return hasScore ? "LIVE" : "Scheduled";
-  if (!raw || raw === "NS" || raw.toLowerCase() === "scheduled" || raw.toLowerCase() === "preview")
-    return "Scheduled";
+  if (!raw || raw === "NS" || raw.toLowerCase() === "scheduled" || raw.toLowerCase() === "preview") return "Scheduled";
   return hasScore ? raw : "Scheduled";
 }
-
 function formatMatch(m) {
   const home = m.strHomeTeam || m.homeTeam || m.strHome || "";
   const away = m.strAwayTeam || m.awayTeam || m.strAway || "";
-
   const s1raw = m.intHomeScore ?? m.intHomeScoreTotal ?? m.intHomeScore1 ?? m.intHomeGoals;
   const s2raw = m.intAwayScore ?? m.intAwayScoreTotal ?? m.intAwayScore1 ?? m.intAwayGoals;
-  const s1 = pickScore(s1raw);
-  const s2 = pickScore(s2raw);
-
+  const s1 = pickScore(s1raw), s2 = pickScore(s2raw);
   const status = normalizeStatus(m, s1, s2);
-
-  return {
-    team1: home,
-    team2: away,
-    score1: s1 === null ? "N/A" : String(s1),
-    score2: s2 === null ? "N/A" : String(s2),
-    headline: `${home} vs ${away} - ${status}`,
-  };
+  return { team1: home, team2: away, score1: s1 === null ? "N/A" : String(s1), score2: s2 === null ? "N/A" : String(s2), headline: `${home} vs ${away} - ${status}` };
 }
-
 function pushUnique(arr, m) {
   const key = m.idEvent || `${m.strHomeTeam}|${m.strAwayTeam}|${m.dateEvent}|${m.strTime}`;
-  if (!arr.some(x => (x.idEvent || `${x.strHomeTeam}|${x.strAwayTeam}|${x.dateEvent}|${x.strTime}`) === key)) {
-    arr.push(m);
-  }
+  if (!arr.some(x => (x.idEvent || `${x.strHomeTeam}|${x.strAwayTeam}|${x.dateEvent}|${x.strTime}`) === key)) arr.push(m);
 }
-
 function isOldFinal(m) {
   const raw = m.strStatus || m.strProgress || "";
   if (!isFinalWord(raw)) return false;
   const t = eventMillis(m);
-  if (Number.isNaN(t)) return false; // can't tell -> keep briefly
+  if (Number.isNaN(t)) return false;              // unknown -> keep briefly
   return (Date.now() - t) > FINAL_KEEP_MS;
 }
 
@@ -138,23 +112,23 @@ async function probe(url, extraHeaders = {}) {
     return { ok: false, status: 0, url, error: String(e) };
   }
 }
-function guessSeasonString() {
+function guessSeasonCrossYear() {
   const d = new Date(); const y = d.getUTCFullYear(); const m = d.getUTCMonth()+1;
   const start = (m >= 7) ? y : (y - 1);
   return `${start}-${start+1}`;
 }
 app.get("/diag", async (_, res) => {
-  const season = guessSeasonString();
+  const season = guessSeasonCrossYear();
   const v2h = { "X-API-KEY": V2_KEY };
   const checks = [];
   checks.push({ env: { node: process.version, hasV2Key: !!V2_KEY, v2KeyLen: (V2_KEY||"").length, hasV1Key: !!V1_KEY, v1Key: V1_KEY }});
   checks.push(await probe(`https://www.thesportsdb.com/api/v2/json/livescore/soccer`, v2h));
-  for (const [_, id] of [["NBA",4387], ["NHL",4380], ["EPL",4328]]) {
+  for (const [_, id] of [["NBA",4387], ["NHL",4380], ["EPL",4328], ["NFL",4391]]) {
     checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${id}`));
     checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsseason.php?id=${id}&s=${encodeURIComponent(season)}`));
     checks.push(await probe(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventspastleague.php?id=${id}`));
   }
-  res.json({ ok:true, season, FINAL_KEEP_MINUTES, checks });
+  res.json({ ok:true, seasonCross: season, FINAL_KEEP_MINUTES, checks });
 });
 
 /* ---------------- TSDB fetchers ---------------- */
@@ -186,6 +160,28 @@ async function v1PastLeague(leagueId) {
   return Array.isArray(j?.events) ? j.events : [];
 }
 
+/* ---------------- season format candidates by league ---------------- */
+function seasonCandidates(sport, leagueId) {
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const cross = guessSeasonCrossYear();       // e.g. "2025-2026"
+  const crossPrev = `${y-1}-${y}`;
+  const single = String(y);
+  const singlePrev = String(y - 1);
+
+  // NFL tends to be single-year; NBA/NHL/EPL tend to be cross-year
+  if (leagueId === 4391 || sport === "american_football") {
+    return [single, singlePrev, cross, crossPrev];
+  }
+  if (leagueId === 4387 || leagueId === 4380) { // NBA / NHL
+    return [cross, crossPrev, single, singlePrev];
+  }
+  if (leagueId === 4328) { // EPL
+    return [cross, crossPrev];
+  }
+  return [cross, single, crossPrev, singlePrev];
+}
+
 /* ---------------- builder: LIVE → NEXT → SEASON (future) → PAST (recent) ---------------- */
 async function getLeagueMatches(sport, leagueId) {
   const out = [];
@@ -207,17 +203,21 @@ async function getLeagueMatches(sport, leagueId) {
     console.log(`[next v1] ${sport} -> ${out.length}`);
   }
 
-  // 3) SEASON (future only; catches preseason)
+  // 3) SEASON (future only; try multiple season formats)
   if (out.length < 5) {
-    const season = guessSeasonString();
-    const e = await v1Season(leagueId, season);
-    const now = Date.now();
-    const fut = e.filter(x => {
-      const t = toMillis(x.dateEvent, x.strTime);
-      return isFinite(t) && t >= now;
-    }).sort((a,b) => toMillis(a.dateEvent, a.strTime) - toMillis(b.dateEvent, b.strTime));
-    for (const m of fut) { if (out.length >= 5) break; pushUnique(out, m); }
-    console.log(`[season v1 ${season}] ${sport} -> ${out.length}`);
+    const tried = [];
+    for (const s of seasonCandidates(sport, leagueId)) {
+      tried.push(s);
+      const e = await v1Season(leagueId, s);
+      const now = Date.now();
+      const fut = e.filter(x => {
+        const t = toMillis(x.dateEvent, x.strTime);
+        return isFinite(t) && t >= now;
+      }).sort((a,b) => toMillis(a.dateEvent, a.strTime) - toMillis(b.dateEvent, b.strTime));
+      for (const m of fut) { if (out.length >= 5) break; pushUnique(out, m); }
+      console.log(`[season v1 tried=${tried.join(",")}] ${sport} -> ${out.length}`);
+      if (out.length >= 5) break;
+    }
   }
 
   // 4) PAST (only very recent finals ≤ 15m)
