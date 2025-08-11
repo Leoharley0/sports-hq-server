@@ -1,4 +1,4 @@
-// server.js — TSDB-only with "hide finals after 15 min" + /diag
+// server.js — TSDB-only with robust time parsing + finals expire + /diag
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -8,21 +8,23 @@ if (typeof fetch !== "function") {
   global.fetch = (...args) => import("node-fetch").then(m => m.default(...args));
 }
 
-// Render → Environment (no quotes):
-//   TSDB_V2_KEY = your v2 key (required; header-based LIVE)
-//   TSDB_V1_KEY = your v1 key (e.g. 123; URL-based)
+// Env (set in Render → Environment, no quotes)
 const V2_KEY = process.env.TSDB_V2_KEY || "";
 const V1_KEY = process.env.TSDB_V1_KEY || "";
+if (!V2_KEY) console.error("❌ Missing TSDB_V2_KEY (required for LIVE)");
+if (!V1_KEY) console.warn("⚠️  TSDB_V1_KEY not set; v1 calls will fail");
 
-// How long a finished game is allowed to remain visible
-const FINAL_KEEP_MINUTES = 15;
-const FINAL_KEEP_MS = FINAL_KEEP_MINUTES * 60 * 1000;
-
+// Keep CDNs happy
 const COMMON_HEADERS = {
   "User-Agent": "SportsHQ/1.0 (+render.com)",
   "Accept": "application/json",
 };
 
+// Finals visibility window
+const FINAL_KEEP_MINUTES = 15;
+const FINAL_KEEP_MS = FINAL_KEEP_MINUTES * 60 * 1000;
+
+/* ---------------- fetch helper ---------------- */
 async function fetchJson(url, extraHeaders = {}) {
   try {
     const res = await fetch(url, { headers: { ...COMMON_HEADERS, ...extraHeaders } });
@@ -37,7 +39,32 @@ async function fetchJson(url, extraHeaders = {}) {
   }
 }
 
-/* ---------------- helpers: status, time & formatting ---------------- */
+/* ---------------- time / status / format helpers ---------------- */
+function toMillis(dateEvent, strTime) {
+  if (!dateEvent) return NaN;
+  const t = (strTime || "00:00:00").trim();
+  // if time already has Z or +/-HH:MM, don't append Z
+  const hasTZ = /[zZ]$|[+\-]\d\d:?\d\d$/.test(t);
+  const iso = `${dateEvent}T${t}${hasTZ ? "" : "Z"}`;
+  const ms = Date.parse(iso);
+  return Number.isNaN(ms) ? NaN : ms;
+}
+
+function eventMillis(m) {
+  if (m.dateEvent) {
+    const ms = toMillis(m.dateEvent, m.strTime);
+    if (!Number.isNaN(ms)) return ms;
+  }
+  if (m.strTimestampMS) {
+    const n = Number(m.strTimestampMS);
+    if (!Number.isNaN(n)) return n;
+  }
+  if (m.strTimestamp) {
+    const n = Number(m.strTimestamp) * 1000;
+    if (!Number.isNaN(n)) return n;
+  }
+  return NaN;
+}
 
 function isLiveWord(s = "") {
   const t = (s + "").toLowerCase();
@@ -52,26 +79,6 @@ function isFinalWord(s = "") {
 }
 function pickScore(v) {
   return (v === undefined || v === null || v === "" || v === "N/A") ? null : v;
-}
-
-// Try to get an event UTC timestamp for filtering finals
-function eventMillis(m) {
-  // Most v1 events have dateEvent + strTime (UTC or Z-suffixed)
-  if (m.dateEvent) {
-    const time = (m.strTime || "00:00:00").replace(" ", "");
-    const ts = Date.parse(`${m.dateEvent}T${time}Z`);
-    if (!Number.isNaN(ts)) return ts;
-  }
-  // Sometimes livescore includes strTimestamp (unix seconds) or strTimestampMS
-  if (m.strTimestampMS) {
-    const n = Number(m.strTimestampMS);
-    if (!Number.isNaN(n)) return n;
-  }
-  if (m.strTimestamp) {
-    const n = Number(m.strTimestamp) * 1000;
-    if (!Number.isNaN(n)) return n;
-  }
-  return NaN; // unknown
 }
 
 // Only mark LIVE when status looks live **and** any score exists
@@ -113,8 +120,15 @@ function pushUnique(arr, m) {
   }
 }
 
-/* ---------------- diagnostics ---------------- */
+function isOldFinal(m) {
+  const raw = m.strStatus || m.strProgress || "";
+  if (!isFinalWord(raw)) return false;
+  const t = eventMillis(m);
+  if (Number.isNaN(t)) return false; // can't tell -> keep briefly
+  return (Date.now() - t) > FINAL_KEEP_MS;
+}
 
+/* ---------------- diagnostics ---------------- */
 async function probe(url, extraHeaders = {}) {
   try {
     const res = await fetch(url, { headers: { ...COMMON_HEADERS, ...extraHeaders } });
@@ -144,8 +158,7 @@ app.get("/diag", async (_, res) => {
 });
 
 /* ---------------- TSDB fetchers ---------------- */
-
-// v2 (header) livescore
+// v2 LIVE
 async function v2Livescore(sport) {
   const s = sport.replace(/_/g, " ");
   const urls = [
@@ -159,8 +172,7 @@ async function v2Livescore(sport) {
   }
   return out;
 }
-
-// v1 (URL key) upcoming/past
+// v1 NEXT/SEASON/PAST
 async function v1NextLeague(leagueId) {
   const j = await fetchJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${leagueId}`);
   return Array.isArray(j?.events) ? j.events : [];
@@ -174,20 +186,11 @@ async function v1PastLeague(leagueId) {
   return Array.isArray(j?.events) ? j.events : [];
 }
 
-/* ---------------- builder: LIVE → NEXT → SEASON → (recent) PAST ---------------- */
-
-function isOldFinal(m) {
-  const raw = m.strStatus || m.strProgress || "";
-  if (!isFinalWord(raw)) return false;
-  const t = eventMillis(m);
-  if (Number.isNaN(t)) return false;               // can't tell => keep (better to show briefly)
-  return (Date.now() - t) > FINAL_KEEP_MS;         // older than window => hide
-}
-
+/* ---------------- builder: LIVE → NEXT → SEASON (future) → PAST (recent) ---------------- */
 async function getLeagueMatches(sport, leagueId) {
   const out = [];
 
-  // 1) LIVE (filter out finals older than window just in case)
+  // 1) LIVE
   const live = await v2Livescore(sport);
   for (const m of live || []) {
     if (String(m.idLeague || "") !== String(leagueId)) continue;
@@ -199,41 +202,32 @@ async function getLeagueMatches(sport, leagueId) {
   // 2) NEXT (upcoming)
   if (out.length < 5) {
     const e = await v1NextLeague(leagueId);
-    e.sort((a,b) =>
-      Date.parse(`${a.dateEvent}T${(a.strTime||"00:00:00").replace(" ","")}Z`) -
-      Date.parse(`${b.dateEvent}T${(b.strTime||"00:00:00").replace(" ","")}Z`)
-    );
+    e.sort((a,b) => toMillis(a.dateEvent, a.strTime) - toMillis(b.dateEvent, b.strTime));
     for (const m of e) { if (out.length >= 5) break; pushUnique(out, m); }
     console.log(`[next v1] ${sport} -> ${out.length}`);
   }
 
-  // 3) SEASON (future only; catches preseason if present)
+  // 3) SEASON (future only; catches preseason)
   if (out.length < 5) {
     const season = guessSeasonString();
     const e = await v1Season(leagueId, season);
     const now = Date.now();
     const fut = e.filter(x => {
-      const t = Date.parse(`${x.dateEvent}T${(x.strTime||"00:00:00").replace(" ","")}Z`);
+      const t = toMillis(x.dateEvent, x.strTime);
       return isFinite(t) && t >= now;
-    }).sort((a,b) =>
-      Date.parse(`${a.dateEvent}T${(a.strTime||"00:00:00").replace(" ","")}Z`) -
-      Date.parse(`${b.dateEvent}T${(b.strTime||"00:00:00").replace(" ","")}Z`)
-    );
+    }).sort((a,b) => toMillis(a.dateEvent, a.strTime) - toMillis(b.dateEvent, b.strTime));
     for (const m of fut) { if (out.length >= 5) break; pushUnique(out, m); }
     console.log(`[season v1 ${season}] ${sport} -> ${out.length}`);
   }
 
-  // 4) PAST finals — but ONLY very recent (≤ FINAL_KEEP_MS)
+  // 4) PAST (only very recent finals ≤ 15m)
   if (out.length < 5) {
     const e = await v1PastLeague(leagueId);
-    e.sort((a,b) =>
-      Date.parse(`${b.dateEvent}T${(b.strTime||"00:00:00").replace(" ","")}Z`) -
-      Date.parse(`${a.dateEvent}T${(a.strTime||"00:00:00").replace(" ","")}Z`)
-    );
+    e.sort((a,b) => toMillis(b.dateEvent, b.strTime) - toMillis(a.dateEvent, a.strTime));
     for (const m of e) {
       if (out.length >= 5) break;
       m.strStatus = m.strStatus || "Final";
-      if (isOldFinal(m)) continue; // skip if older than window
+      if (isOldFinal(m)) continue;
       pushUnique(out, m);
     }
     console.log(`[past v1 recent≤${FINAL_KEEP_MINUTES}m] ${sport} -> ${out.length}`);
@@ -243,7 +237,6 @@ async function getLeagueMatches(sport, leagueId) {
 }
 
 /* ---------------- endpoints ---------------- */
-
 const CONFIGS = {
   "/scores/soccer": { sport: "soccer",            leagueId: 4328 },
   "/scores/nba":    { sport: "basketball",        leagueId: 4387 },
