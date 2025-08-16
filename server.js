@@ -94,8 +94,9 @@ function sortForDisplay(a,b){
 function leagueMatch(m, leagueId, sport){
   const idOk = String(m.idLeague||"")===String(leagueId);
   const name = String(m.strLeague||"").toLowerCase();
+
   if (sport==="american_football") return idOk || name.includes("nfl");
-  if (sport==="basketball")        return idOk || name.includes("nba");
+  if (sport==="basketball")        return idOk; // NBA only (leagueId 4387)
   if (sport==="ice_hockey")        return idOk || name.includes("nhl");
   return idOk; // soccer EPL stays strict
 }
