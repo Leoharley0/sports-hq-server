@@ -1,347 +1,294 @@
-// server.js — SportsHQ v9 (multi-soccer with hard fallback IDs, per-league logs, manual override)
+// server.js — SportsHQ v12 (soccer limited to EPL/Bundesliga/LaLiga/Ligue1, time-aware LIVE, 429-resilient)
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ v9 (soccer fallback + per-league logs + override)";
+const BUILD = "SportsHQ v12 (4-league soccer + time-aware LIVE + 429 resilience)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
-// Polyfill fetch for older Node
+// Polyfill fetch if needed
 if (typeof fetch !== "function") {
   global.fetch = (...args) => import("node-fetch").then(m => m.default(...args));
 }
 
-// --- Environment / keys (Render → Environment) ---
-const V2_KEY = process.env.TSDB_V2_KEY || "";      // livescore (optional)
-const V1_KEY = process.env.TSDB_V1_KEY || "3";     // v1 schedule; default to free key "3"
-if (!V1_KEY) console.warn("⚠️ TSDB_V1_KEY missing; using free key '3'.");
-if (!V2_KEY) console.warn("ℹ️ TSDB_V2_KEY not set; live rows might be fewer.");
+// --- Environment keys ---
+const V2_KEY = process.env.TSDB_V2_KEY || "";   // optional (livescore)
+const V1_KEY = process.env.TSDB_V1_KEY || "3";  // default free key
+if (!V1_KEY) console.warn("⚠️ TSDB_V1_KEY missing; using '3'.");
+if (!V2_KEY) console.warn("ℹ️ TSDB_V2_KEY not set; live rows may be fewer.");
 
 // --- Tunables ---
-const DEFAULT_COUNT = 10; // items per endpoint (overridable via ?n=)
+const DEFAULT_COUNT = 10;
 const TTL = {
-  LIVE: 15e3, NEXT: 5 * 60e3, SEASON: 3 * 60 * 60e3, DAY: 30 * 60e3, PAST: 10 * 60e3, OUT: 25e3, META: 12 * 60 * 60e3
+  LIVE:   15e3,           // v2 livescore
+  NEXT:   5 * 60e3,       // next league
+  SEASON: 3 * 60 * 60e3,  // season schedule
+  DAY:    30 * 60e3,      // events by day
+  PAST:   10 * 60e3,      // past
+  OUT:    45e3,           // merged output cache
+  META:   12 * 60 * 60e3, // not used here, kept for parity
 };
-const COMMON_HEADERS = { "User-Agent": "SportsHQ/1.0 (+render.com)", "Accept": "application/json" };
+const COMMON_HEADERS = { "User-Agent":"SportsHQ/1.0 (+render.com)", "Accept":"application/json" };
 
-// --- Tiny cache ---
-const cache = new Map();
+// --- Caches: fresh, last-good fallback, and in-flight dedupe ---
+const cache    = new Map();
+const lastGood = new Map();
+const inflight = new Map();
 const getC = k => { const v = cache.get(k); if (v && v.exp > Date.now()) return v.val; if (v) cache.delete(k); return null; };
-const setC = (k, val, ttl) => cache.set(k, { val, exp: Date.now() + ttl });
+const setC = (k,val,ttl) => { cache.set(k,{val,exp:Date.now()+ttl}); lastGood.set(k,val); };
 
-// --- Fetch helpers ---
-async function fetchText(url, extra = {}) {
+async function fetchText(url, extra={}) {
   const res = await fetch(url, { headers: { ...COMMON_HEADERS, ...extra } });
   const txt = await res.text();
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText} | ${txt.slice(0, 180)}`);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText} | ${txt.slice(0,180)}`);
   return txt;
 }
-async function fetchJson(url, extra = {}) { return JSON.parse(await fetchText(url, extra)); }
-async function memoJson(url, ttl, extra = {}) {
-  const k = `URL:${url}`;
-  const hit = getC(k); if (hit) return hit;
-  try { const j = await fetchJson(url, extra); if (j) setC(k, j, ttl); return j; }
-  catch (e) { console.error("fetchJson error:", e.message, "→", url); return null; }
+async function fetchJson(url, extra={}) { return JSON.parse(await fetchText(url, extra)); }
+
+async function memoJson(url, ttl, extra={}) {
+  const key = `URL:${url}`;
+  const hit = getC(key); if (hit) return hit;
+  if (inflight.has(key)) return inflight.get(key);
+  const p = (async () => {
+    try {
+      const j = await fetchJson(url, extra);
+      if (j) setC(key, j, ttl);
+      return j;
+    } catch (e) {
+      console.error("fetchJson error:", e.message, "→", url);
+      const lg = lastGood.get(key);
+      if (lg) { console.warn("↺ using last-good for", url); return lg; }
+      return null;
+    } finally { inflight.delete(key); }
+  })();
+  inflight.set(key, p);
+  return p;
 }
 
-// --- Time + status helpers ---
-function cleanTime(t) { if (!t) return "00:00:00"; const s = String(t).trim(); return (/^tba$|^tbd$/i.test(s)) ? "00:00:00" : s; }
-function toMillis(dateStr, timeStr) {
-  if (!dateStr) return NaN;
-  const t = cleanTime(timeStr);
-  const hasTZ = /[zZ]$|[+\-]\d\d:?\d\d$/.test(t);
-  const ms = Date.parse(`${dateStr}T${t}${hasTZ ? "" : "Z"}`); // assume UTC if no TZ
-  return Number.isNaN(ms) ? NaN : ms;
-}
-function eventMillis(m) {
-  let ms = toMillis(m.dateEvent, m.strTime); if (!Number.isNaN(ms)) return ms;
-  ms = toMillis(m.dateEventLocal || m.dateEvent, m.strTimeLocal || m.strTime); if (!Number.isNaN(ms)) return ms;
-  if (m.strTimestampMS) { const n = +m.strTimestampMS; if (!Number.isNaN(n)) return n; }
-  if (m.strTimestamp) { const n = +m.strTimestamp * 1000; if (!Number.isNaN(n)) return n; }
-  if (m.dateEvent) { ms = toMillis(m.dateEvent, "00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
-  if (m.dateEventLocal) { ms = toMillis(m.dateEventLocal, "00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
+// --- Time / status helpers ---
+function cleanTime(t){ if(!t) return "00:00:00"; const s=String(t).trim(); return (/^tba$|^tbd$/i.test(s))?"00:00:00":s; }
+function toMillis(dateStr, timeStr){ if(!dateStr) return NaN; const t=cleanTime(timeStr); const hasTZ=/[zZ]$|[+\-]\d\d:?\d\d$/.test(t); const ms=Date.parse(`${dateStr}T${t}${hasTZ?"":"Z"}`); return Number.isNaN(ms)?NaN:ms; }
+function eventMillis(m){
+  let ms=toMillis(m.dateEvent,m.strTime); if (!Number.isNaN(ms)) return ms;
+  ms=toMillis(m.dateEventLocal||m.dateEvent,m.strTimeLocal||m.strTime); if (!Number.isNaN(ms)) return ms;
+  if (m.strTimestampMS){ const n=+m.strTimestampMS; if(!Number.isNaN(n)) return n; }
+  if (m.strTimestamp){ const n=+m.strTimestamp*1000; if(!Number.isNaN(n)) return n; }
+  if (m.dateEvent){ ms=toMillis(m.dateEvent,"00:00:00Z"); if(!Number.isNaN(ms)) return ms; }
+  if (m.dateEventLocal){ ms=toMillis(m.dateEventLocal,"00:00:00Z"); if(!Number.isNaN(ms)) return ms; }
   return NaN;
 }
-function pickScore(v) { return (v === undefined || v === null || v === "" || v === "N/A") ? null : v; }
-function isLiveWord(s = "") { const t = (s + "").toLowerCase(); return t.includes("live") || t.includes("in play") || /^q\d/.test(t) || t.includes("quarter") || t.includes("ot") || t.includes("overtime") || t.includes("half") || t === "ht" || t === "1h" || t === "2h"; }
-function isFinalWord(s = "") { const t = (s + "").toLowerCase(); return t.includes("final") || t === "ft" || t.includes("full time"); }
-// IMPORTANT: if it looks live, call it LIVE (even before scores post)
-function normalizeStatus(m, s1, s2) {
+function pickScore(v){ return (v===undefined||v===null||v===""||v==="N/A")?null:v; }
+function isLiveWord(s=""){ const t=(s+"").toLowerCase(); return t==="live"||t.includes("in play")||t==="ht"||t==="1h"||t==="2h"; }
+function isFinalWord(s=""){ const t=(s+"").toLowerCase(); return t.includes("final")||t==="ft"||t.includes("full time"); }
+
+// time-aware LIVE
+function normalizeStatus(m, s1, s2){
   const raw = String(m.strStatus || m.strProgress || "").trim();
+  const ms  = eventMillis(m);
+  const now = Date.now();
+
   if (isFinalWord(raw)) return "Final";
-  if (isLiveWord(raw)) return "LIVE";
-  if (!raw || raw === "NS" || raw.toLowerCase() === "scheduled" || raw.toLowerCase() === "preview") return "Scheduled";
-  const hasScore = (s1 !== null) || (s2 !== null);
-  return hasScore ? raw : "Scheduled";
+
+  if (isLiveWord(raw)) {
+    if (isFinite(ms) && ms > now + 15*60*1000) return "Scheduled";               // kickoff clearly in future
+    if (s1===null && s2===null && isFinite(ms) && now < ms + 10*60*1000) return "Scheduled"; // just before/after KO w/o scores
+    return "LIVE";
+  }
+
+  const low = raw.toLowerCase();
+  if (!raw || low==="ns" || low==="not started" || low==="scheduled" || low==="preview") return "Scheduled";
+  return (s1!==null || s2!==null) ? raw : "Scheduled";
 }
-const FINAL_KEEP_MS = 15 * 60 * 1000;
-function isOldFinal(m) { const raw = m.strStatus || m.strProgress || ""; if (!isFinalWord(raw)) return false; const t = eventMillis(m); if (Number.isNaN(t)) return false; return (Date.now() - t) > FINAL_KEEP_MS; }
-function computedStatus(m) { const s1 = pickScore(m.intHomeScore ?? m.intHomeGoals), s2 = pickScore(m.intAwayScore ?? m.intAwayGoals); return normalizeStatus(m, s1, s2); }
-function matchKey(m) { return m.idEvent || `${m.strHomeTeam}|${m.strAwayTeam}|${m.dateEvent || m.dateEventLocal || ""}`; }
-function pushUnique(arr, m) { const k = matchKey(m); if (!arr.some(x => matchKey(x) === k)) arr.push(m); }
-function sortForDisplay(a, b) {
-  const sa = computedStatus(a), sb = computedStatus(b);
-  const pa = (sa === "Final") ? 0 : (sa === "LIVE") ? 1 : 2;
-  const pb = (sb === "Final") ? 0 : (sb === "LIVE") ? 1 : 2;
-  if (pa !== pb) return pa - pb;
-  const ta = eventMillis(a), tb = eventMillis(b);
-  const aBad = !isFinite(ta), bBad = !isFinite(tb);
+const FINAL_KEEP_MS = 15*60*1000;
+function isOldFinal(m){ const raw=m.strStatus||m.strProgress||""; if(!isFinalWord(raw)) return false; const t=eventMillis(m); if(Number.isNaN(t)) return false; return (Date.now()-t)>FINAL_KEEP_MS; }
+function computedStatus(m){ const s1=pickScore(m.intHomeScore??m.intHomeGoals), s2=pickScore(m.intAwayScore??m.intAwayGoals); return normalizeStatus(m,s1,s2); }
+function matchKey(m){ return m.idEvent || `${m.strHomeTeam}|${m.strAwayTeam}|${m.dateEvent||m.dateEventLocal||""}`; }
+function pushUnique(arr,m){ const k=matchKey(m); if(!arr.some(x=>matchKey(x)===k)) arr.push(m); }
+function sortForDisplay(a,b){
+  const sa=computedStatus(a), sb=computedStatus(b);
+  const pa=(sa==="Final")?0:(sa==="LIVE")?1:2, pb=(sb==="Final")?0:(sb==="LIVE")?1:2;
+  if (pa!==pb) return pa-pb;
+  const ta=eventMillis(a), tb=eventMillis(b);
+  const aBad=!isFinite(ta), bBad=!isFinite(tb);
   if (aBad && !bBad) return +1;
   if (!aBad && bBad) return -1;
-  if (pa === 0) return tb - ta; // Finals newest first
-  return ta - tb;               // Live/Scheduled soonest first
+  if (pa===0) return tb-ta;   // finals newest first
+  return ta-tb;               // live/scheduled soonest first
 }
 
-// --- League matching (single-league sports) ---
-function leagueMatch(m, leagueId, sport) {
-  const idOk = String(m.idLeague || "") === String(leagueId);
-  const name = String(m.strLeague || "").toLowerCase();
-  if (sport === "american_football") return idOk || name.includes("nfl");
-  if (sport === "basketball")        return idOk; // NBA only (4387)
-  if (sport === "ice_hockey")        return idOk || name.includes("nhl");
-  return idOk; // soccer handled via multi-league aggregator
+// --- League matching for single-league sports ---
+function leagueMatch(m, leagueId, sport){
+  const idOk = String(m.idLeague||"")===String(leagueId);
+  const name = String(m.strLeague||"").toLowerCase();
+  if (sport==="american_football") return idOk || name.includes("nfl");
+  if (sport==="basketball")        return idOk; // NBA only
+  if (sport==="ice_hockey")        return idOk || name.includes("nhl");
+  return idOk;
 }
 
-// --- TSDB fetchers (memoized) ---
-async function v2Livescore(sport) {
-  if (!V2_KEY) return []; // allow running without v2 key
-  const s = sport.replace(/_/g, " ");
-  const urls = [
+// --- TSDB fetchers ---
+async function v2Livescore(sport){
+  if (!V2_KEY) return [];
+  const s=sport.replace(/_/g," ");
+  const urls=[
     `https://www.thesportsdb.com/api/v2/json/livescore/${encodeURIComponent(s)}`,
     `https://www.thesportsdb.com/api/v2/json/livescore.php?s=${encodeURIComponent(s)}`
   ];
-  const out = [];
-  for (const u of urls) {
-    const j = await memoJson(u, TTL.LIVE, { "X-API-KEY": V2_KEY });
-    if (j?.livescore?.length) out.push(...j.livescore);
-  }
+  const out=[]; for (const u of urls){ const j=await memoJson(u, TTL.LIVE, {"X-API-KEY":V2_KEY}); if (j?.livescore?.length) out.push(...j.livescore); }
   return out;
 }
-async function v1NextLeague(id)  { const j = await memoJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${id}`, TTL.NEXT);   return Array.isArray(j?.events) ? j.events : []; }
-async function v1Season(id, s)   { const j = await memoJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsseason.php?id=${id}&s=${encodeURIComponent(s)}`, TTL.SEASON); return Array.isArray(j?.events) ? j.events : []; }
-async function v1PastLeague(id)  { const j = await memoJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventspastleague.php?id=${id}`, TTL.PAST);      return Array.isArray(j?.events) ? j.events : []; }
-const SPORT_LABEL = { soccer: "Soccer", basketball: "Basketball", american_football: "American Football", ice_hockey: "Ice Hockey" };
-async function v1EventsDay(sport, ymd) {
-  const label = SPORT_LABEL[sport] || sport;
-  const j = await memoJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsday.php?d=${ymd}&s=${encodeURIComponent(label)}`, TTL.DAY);
-  return Array.isArray(j?.events) ? j.events : [];
-}
+async function v1NextLeague(id){ const j=await memoJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsnextleague.php?id=${id}`, TTL.NEXT); return Array.isArray(j?.events)?j.events:[]; }
+async function v1Season(id,s){ const j=await memoJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsseason.php?id=${id}&s=${encodeURIComponent(s)}`, TTL.SEASON); return Array.isArray(j?.events)?j.events:[]; }
+async function v1PastLeague(id){ const j=await memoJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventspastleague.php?id=${id}`, TTL.PAST); return Array.isArray(j?.events)?j.events:[]; }
+const SPORT_LABEL={ soccer:"Soccer", basketball:"Basketball", american_football:"American Football", ice_hockey:"Ice Hockey" };
+async function v1EventsDay(sport, ymd){ const label=SPORT_LABEL[sport]||sport; const j=await memoJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/eventsday.php?d=${ymd}&s=${encodeURIComponent(label)}`, TTL.DAY); return Array.isArray(j?.events)?j.events:[]; }
 
 // --- Seasons ---
-function guessSeasonCrossYear() { const d = new Date(), y = d.getUTCFullYear(), m = d.getUTCMonth() + 1, s = (m >= 7) ? y : y - 1; return `${s}-${s + 1}`; }
-function seasonCandidates(sport, leagueId) {
-  const d = new Date(), y = d.getUTCFullYear(), cross = guessSeasonCrossYear(), crossPrev = `${y - 1}-${y}`, single = String(y), singlePrev = String(y - 1);
-  if (leagueId === 4391 || sport === "american_football") return [single, singlePrev, cross, crossPrev];
-  if (leagueId === 4387 || leagueId === 4380)             return [cross, crossPrev, single, singlePrev];
-  if (leagueId === 4328)                                   return [cross, crossPrev]; // EPL
+function guessSeasonCrossYear(){ const d=new Date(), y=d.getUTCFullYear(), m=d.getUTCMonth()+1, s=(m>=7)?y:y-1; return `${s}-${s+1}`; }
+function seasonCandidates(sport, leagueId){
+  const d=new Date(), y=d.getUTCFullYear(), cross=guessSeasonCrossYear(), crossPrev=`${y-1}-${y}`, single=String(y), singlePrev=String(y-1);
+  if (leagueId===4391||sport==="american_football") return [single, singlePrev, cross, crossPrev];
+  if (leagueId===4387||leagueId===4380)             return [cross, crossPrev, single, singlePrev];
+  if (leagueId===4328)                               return [cross, crossPrev];
   return [cross, single, crossPrev, singlePrev];
 }
 
-// --- Fill future by day until n ---
-async function fillByDaysUntil(out, sport, leagueId, n, maxWeeks = 6) {
-  if (out.length >= n) return;
-  const keys = new Set(out.map(matchKey));
-  const today = new Date();
-  for (let w = 0; w < maxWeeks && out.length < n; w++) {
-    for (let d = 0; d < 7 && out.length < n; d++) {
-      const dt = new Date(today.getTime() + (w * 7 + d) * 86400000);
-      const ymd = dt.toISOString().slice(0, 10);
-      const rows = await v1EventsDay(sport, ymd);
-      for (const m of rows) {
-        if (out.length >= n) break;
+// --- Day scan (lighter) ---
+async function fillByDaysUntil(out, sport, leagueId, n, maxWeeks=3){
+  if (out.length>=n) return;
+  const keys=new Set(out.map(matchKey));
+  const today=new Date();
+  for (let w=0; w<maxWeeks && out.length<n; w++){
+    for (let d=0; d<7 && out.length<n; d++){
+      const dt=new Date(today.getTime()+(w*7+d)*86400000);
+      const ymd=dt.toISOString().slice(0,10);
+      const rows=await v1EventsDay(sport, ymd);
+      for (const m of rows){
+        if (out.length>=n) break;
         if (!leagueMatch(m, leagueId, sport)) continue;
-        const ms = eventMillis(m); if (isFinite(ms) && ms < Date.now()) continue;
-        const k = matchKey(m); if (keys.has(k)) continue;
+        const ms=eventMillis(m); if (isFinite(ms)&&ms<Date.now()) continue;
+        const k=matchKey(m); if (keys.has(k)) continue;
         keys.add(k); out.push(m);
       }
     }
-    console.log(`[day fill week ${w}] ${sport}/${leagueId} -> ${out.length}/${n}`);
+    console.log(`[day v1 fill week ${w}] ${sport}/${leagueId} -> ${out.length}/${n}`);
   }
 }
 
-// --- Build list (single league) ---
-async function getLeagueMatchesCore(sport, leagueId, n) {
-  const out = [];
+// --- Build list for a single league ---
+async function getLeagueMatchesCore(sport, leagueId, n){
+  const out=[];
 
-  // 1) LIVE
-  const live = await v2Livescore(sport);
-  for (const m of live || []) { if (!leagueMatch(m, leagueId, sport)) continue; if (isOldFinal(m)) continue; pushUnique(out, m); }
+  const live=await v2Livescore(sport);
+  for (const m of live||[]){ if (!leagueMatch(m, leagueId, sport)) continue; if (isOldFinal(m)) continue; pushUnique(out,m); }
   console.log(`[live] ${sport}/${leagueId} -> ${out.length}`);
 
-  // 2) NEXT (league)
-  if (out.length < n) {
-    const e = await v1NextLeague(leagueId);
-    e.sort((a, b) => eventMillis(a) - eventMillis(b));
-    for (const m of e) { if (out.length >= n) break; if (!leagueMatch(m, leagueId, sport)) continue; pushUnique(out, m); }
-    console.log(`[next] ${sport}/${leagueId} -> ${out.length}/${n}`);
+  if (out.length<n){
+    const e=await v1NextLeague(leagueId);
+    e.sort((a,b)=>eventMillis(a)-eventMillis(b));
+    for (const m of e){ if (out.length>=n) break; if (!leagueMatch(m, leagueId, sport)) continue; pushUnique(out,m); }
+    console.log(`[next v1] ${sport}/${leagueId} -> ${out.length}/${n}`);
   }
 
-  // 3) SEASON (future only)
-  if (out.length < n) {
-    for (const s of seasonCandidates(sport, leagueId)) {
-      const e = await v1Season(leagueId, s);
-      const now = Date.now();
-      const fut = e.filter(x => leagueMatch(x, leagueId, sport) && isFinite(eventMillis(x)) && eventMillis(x) >= now)
-                   .sort((a, b) => eventMillis(a) - eventMillis(b));
-      for (const m of fut) { if (out.length >= n) break; pushUnique(out, m); }
+  if (out.length<n){
+    for (const s of seasonCandidates(sport, leagueId)){
+      const e=await v1Season(leagueId,s);
+      const now=Date.now();
+      const fut=e.filter(x=>leagueMatch(x,leagueId,sport) && isFinite(eventMillis(x)) && eventMillis(x)>=now)
+                 .sort((a,b)=>eventMillis(a)-eventMillis(b));
+      for (const m of fut){ if (out.length>=n) break; pushUnique(out,m); }
       console.log(`[season ${s}] ${sport}/${leagueId} -> ${out.length}/${n}`);
-      if (out.length >= n) break;
+      if (out.length>=n) break;
     }
   }
 
-  // 4) DAY scan
-  await fillByDaysUntil(out, sport, leagueId, n, 6);
+  await fillByDaysUntil(out, sport, leagueId, n, 3);
 
-  // 5) PAST (recent finals ≤15m)
-  if (out.length < n) {
-    const e = await v1PastLeague(leagueId);
-    e.sort((a, b) => eventMillis(b) - eventMillis(a));
-    for (const m of e) { if (out.length >= n) break; if (!leagueMatch(m, leagueId, sport)) continue; m.strStatus = m.strStatus || "Final"; if (isOldFinal(m)) continue; pushUnique(out, m); }
-    console.log(`[past] ${sport}/${leagueId} -> ${out.length}/${n}`);
+  if (out.length<n){
+    const e=await v1PastLeague(leagueId);
+    e.sort((a,b)=>eventMillis(b)-eventMillis(a));
+    for (const m of e){ if (out.length>=n) break; if (!leagueMatch(m,leagueId,sport)) continue; m.strStatus=m.strStatus||"Final"; if (isOldFinal(m)) continue; pushUnique(out,m); }
+    console.log(`[past recent] ${sport}/${leagueId} -> ${out.length}/${n}`);
   }
 
   out.sort(sortForDisplay);
-  return out.slice(0, n);
+  return out.slice(0,n);
 }
 
-// Cache wrapper
-async function getLeagueMatchesCached(sport, leagueId, n) {
-  const key = `OUT:${sport}:${leagueId}:${n}`;
-  const hit = getC(key); if (hit) return hit;
-  const data = await getLeagueMatchesCore(sport, leagueId, n);
-  setC(key, data, TTL.OUT + Math.floor(Math.random() * 5000));
+// --- Cache wrapper ---
+async function getLeagueMatchesCached(sport, leagueId, n){
+  const key=`OUT:${sport}:${leagueId}:${n}`;
+  const hit=getC(key); if (hit) return hit;
+  const data=await getLeagueMatchesCore(sport, leagueId, n);
+  setC(key, data, TTL.OUT + Math.random()*5000);
   return data;
 }
 
-// --- Multi-league soccer (with hard fallback + manual override) ---
-const HARDCODED_SOCCER_IDS = [4328, 4335, 4332, 4331, 4334, 4337, 4344, 4346]; // EPL, LaLiga, SerieA, Bundesliga, Ligue1, Eredivisie, Primeira, MLS
-const BIG_SOCCER_NAMES = [
-  "English Premier League", "Spanish La Liga", "La Liga",
-  "Italian Serie A", "Serie A", "German Bundesliga", "Bundesliga",
-  "French Ligue 1", "Ligue 1", "Dutch Eredivisie", "Eredivisie",
-  "Portuguese Primeira Liga", "Primeira Liga", "Major League Soccer", "MLS"
+// --- Soccer: only these 4 leagues ---
+const SOCCER_IDS = [
+  4328, // English Premier League
+  4331, // German Bundesliga
+  4335, // Spanish La Liga
+  4334, // French Ligue 1
 ];
 
-async function resolveSoccerLeagueIdsByName(names = BIG_SOCCER_NAMES) {
-  const k = "META:SOCCER:LEAGUE_IDS";
-  const hit = getC(k); if (hit) return hit;
-  const j = await memoJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/search_all_leagues.php?s=Soccer`, TTL.META);
-  const arr = Array.isArray(j?.countrys) ? j.countrys : [];
-  const want = new Set(names.map(s => s.toLowerCase()));
-  let ids = [];
-  for (const row of arr) {
-    const name = (row.strLeague || "").toLowerCase();
-    if (want.has(name)) ids.push(parseInt(row.idLeague, 10));
-  }
-  if (!ids.length) {
-    console.warn("[meta] resolve failed or empty; using hardcoded soccer IDs:", HARDCODED_SOCCER_IDS.join(", "));
-    ids = HARDCODED_SOCCER_IDS.slice();
-  } else {
-    console.log("[meta] soccer big-league ids:", ids.join(", "));
-  }
-  setC(k, ids, TTL.META);
-  return ids;
-}
-
-async function getSoccerBigLeagues(n, ids) {
-  const leagueIds = Array.isArray(ids) && ids.length ? ids : await resolveSoccerLeagueIdsByName();
-  const merged = [];
-  const per = [];
-  for (const id of leagueIds) {
-    const items = await getLeagueMatchesCached("soccer", id, n);
+async function getSoccerBigLeagues(n){
+  const merged=[]; const per=[];
+  for (const id of SOCCER_IDS){
+    const items=await getLeagueMatchesCached("soccer", id, n);
     per.push(`${id}:${items.length}`);
     for (const m of items) pushUnique(merged, m);
   }
   console.log(`[soccer agg] perLeague {${per.join(", ")}} merged=${merged.length}`);
   merged.sort(sortForDisplay);
-  return merged.slice(0, n);
+  return merged.slice(0,n);
 }
 
 // --- Output shape for Roblox ---
-function formatMatch(m) {
-  const home = m.strHomeTeam || m.homeTeam || m.strHome || "";
-  const away = m.strAwayTeam || m.awayTeam || m.strAway || "";
-  const s1 = pickScore(m.intHomeScore ?? m.intHomeGoals);
-  const s2 = pickScore(m.intAwayScore ?? m.intAwayGoals);
-  const status = computedStatus(m);
-  const ms = eventMillis(m);
+function formatMatch(m){
+  const home=m.strHomeTeam||m.homeTeam||m.strHome||"";
+  const away=m.strAwayTeam||m.awayTeam||m.strAway||"";
+  const s1=pickScore(m.intHomeScore??m.intHomeGoals);
+  const s2=pickScore(m.intAwayScore??m.intAwayGoals);
+  const status=computedStatus(m);
+  const ms=eventMillis(m);
   return {
     league: m.strLeague || "",
     team1: home, team2: away,
-    score1: s1 === null ? "N/A" : String(s1),
-    score2: s2 === null ? "N/A" : String(s2),
-    status, isLive: status === "LIVE",
+    score1: s1===null?"N/A":String(s1),
+    score2: s2===null?"N/A":String(s2),
+    status, isLive: status==="LIVE",
     headline: `${home} vs ${away} - ${status}`,
-    start: isFinite(ms) ? new Date(ms).toISOString() : null
+    start: isFinite(ms)?new Date(ms).toISOString():null
   };
 }
 
 // --- Endpoints ---
 const CONFIGS = {
-  "/scores/nba":    { sport: "basketball",        leagueId: 4387 },
-  "/scores/nfl":    { sport: "american_football", leagueId: 4391 },
-  "/scores/nhl":    { sport: "ice_hockey",        leagueId: 4380 },
+  "/scores/nba":    { sport:"basketball",        leagueId:4387 },
+  "/scores/nfl":    { sport:"american_football", leagueId:4391 },
+  "/scores/nhl":    { sport:"ice_hockey",        leagueId:4380 },
 };
 
-// Multi-league soccer (supports manual ids override via ?ids=4328,4335,...)
-app.get("/scores/soccer", async (req, res) => {
-  try {
+app.get("/scores/soccer", async (req,res)=>{
+  try{
     const n = Math.max(5, Math.min(20, parseInt(req.query.n || DEFAULT_COUNT, 10) || DEFAULT_COUNT));
-    const ids = (req.query.ids ? String(req.query.ids).split(",").map(x => parseInt(x, 10)).filter(Boolean) : null);
-    const items = await getSoccerBigLeagues(n, ids);
-    console.log(`/scores/soccer ids=${ids ? ids.join(",") : "auto"} → ${items.length} items (n=${n})`);
+    const items = await getSoccerBigLeagues(n);
+    console.log(`/scores/soccer → ${items.length} items (n=${n})`);
     res.json(items.map(formatMatch));
-  } catch (e) {
-    console.error("/scores/soccer handler error:", e);
-    res.status(500).json({ error: "internal" });
-  }
+  }catch(e){ console.error("/scores/soccer error:", e); res.status(500).json({error:"internal"}); }
 });
 
-// Single-league routes
-for (const [path, cfg] of Object.entries(CONFIGS)) {
-  app.get(path, async (req, res) => {
-    try {
+for (const [path,cfg] of Object.entries(CONFIGS)){
+  app.get(path, async (req,res)=>{
+    try{
       const n = Math.max(5, Math.min(20, parseInt(req.query.n || DEFAULT_COUNT, 10) || DEFAULT_COUNT));
       const items = await getLeagueMatchesCached(cfg.sport, cfg.leagueId, n);
       console.log(`${path} → ${items.length} items (n=${n})`);
       res.json(items.map(formatMatch));
-    } catch (e) {
-      console.error(path, "handler error:", e);
-      res.status(500).json({ error: "internal" });
-    }
+    }catch(e){ console.error(path,"error:",e); res.status(500).json({error:"internal"}); }
   });
 }
 
-// Test helpers
-app.get("/scores/epl", async (req, res) => {
-  try {
-    const n = Math.max(5, Math.min(20, parseInt(req.query.n || DEFAULT_COUNT, 10) || DEFAULT_COUNT));
-    const items = await getLeagueMatchesCached("soccer", 4328, n);
-    console.log(`/scores/epl → ${items.length} items (n=${n})`);
-    res.json(items.map(formatMatch));
-  } catch (e) { res.status(500).json({ error: "internal" }); }
-});
-
-app.get("/demo/soccer", (_req, res) => {
-  const now = Math.floor(Date.now()/1000);
-  const iso = (t)=>new Date(t*1000).toISOString();
-  const rows = [
-    { league:"English Premier League", team1:"Arsenal", team2:"Chelsea",  score1:"N/A", score2:"N/A", status:"Scheduled", start: iso(now+3600) },
-    { league:"Spanish La Liga",       team1:"Real Madrid", team2:"Sevilla", status:"LIVE", isLive:true, score1:"1", score2:"0", start: iso(now-1200) },
-    { league:"Italian Serie A",       team1:"Inter", team2:"Napoli",  status:"Scheduled", start: iso(now+7200) },
-    { league:"German Bundesliga",     team1:"Bayern", team2:"Dortmund", status:"Final", score1:"2", score2:"1", start: iso(now-7800) },
-  ];
-  console.log("[/demo/soccer] rows=", rows.length);
-  res.json(rows);
-});
-
-// Diag / health
-app.get("/health", (_, res) => res.json({ ok: true }));
-app.get("/diag", async (_req, res) => {
-  try {
-    const ids = await resolveSoccerLeagueIdsByName();
-    res.json({ build: BUILD, haveV1Key: !!V1_KEY, haveV2Key: !!V2_KEY, soccerLeagueIds: ids });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.listen(PORT, () => console.log(`Server listening on ${PORT} — ${BUILD}`));
+app.get("/health",(_,res)=>res.json({ok:true}));
+app.listen(PORT, ()=>console.log(`Server listening on ${PORT} — ${BUILD}`));
