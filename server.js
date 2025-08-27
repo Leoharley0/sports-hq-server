@@ -1,9 +1,9 @@
-// server.js — SportsHQ v8 (multi-soccer + robust LIVE + status/isLive + caching)
+// server.js — SportsHQ v9 (multi-soccer with hard fallback IDs, per-league logs, manual override)
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ v8 (multi-soccer + robust LIVE)";
+const BUILD = "SportsHQ v9 (soccer fallback + per-league logs + override)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 // Polyfill fetch for older Node
@@ -20,13 +20,7 @@ if (!V2_KEY) console.warn("ℹ️ TSDB_V2_KEY not set; live rows might be fewer.
 // --- Tunables ---
 const DEFAULT_COUNT = 10; // items per endpoint (overridable via ?n=)
 const TTL = {
-  LIVE: 15e3,
-  NEXT: 5 * 60e3,
-  SEASON: 3 * 60 * 60e3,
-  DAY: 30 * 60e3,
-  PAST: 10 * 60e3,
-  OUT: 25e3,
-  META: 12 * 60 * 60e3
+  LIVE: 15e3, NEXT: 5 * 60e3, SEASON: 3 * 60 * 60e3, DAY: 30 * 60e3, PAST: 10 * 60e3, OUT: 25e3, META: 12 * 60 * 60e3
 };
 const COMMON_HEADERS = { "User-Agent": "SportsHQ/1.0 (+render.com)", "Accept": "application/json" };
 
@@ -98,7 +92,7 @@ function sortForDisplay(a, b) {
   return ta - tb;               // Live/Scheduled soonest first
 }
 
-// --- League matching (used for single-league sports) ---
+// --- League matching (single-league sports) ---
 function leagueMatch(m, leagueId, sport) {
   const idOk = String(m.idLeague || "") === String(leagueId);
   const name = String(m.strLeague || "").toLowerCase();
@@ -219,39 +213,46 @@ async function getLeagueMatchesCached(sport, leagueId, n) {
   return data;
 }
 
-// --- Multi-league soccer (resolve IDs by name once) ---
+// --- Multi-league soccer (with hard fallback + manual override) ---
+const HARDCODED_SOCCER_IDS = [4328, 4335, 4332, 4331, 4334, 4337, 4344, 4346]; // EPL, LaLiga, SerieA, Bundesliga, Ligue1, Eredivisie, Primeira, MLS
 const BIG_SOCCER_NAMES = [
-  "English Premier League",
-  "Spanish La Liga", "La Liga",
-  "Italian Serie A", "Serie A",
-  "German Bundesliga", "Bundesliga",
-  "French Ligue 1", "Ligue 1",
-  "Dutch Eredivisie", "Eredivisie",
-  "Portuguese Primeira Liga", "Primeira Liga",
-  "Major League Soccer", "MLS"
+  "English Premier League", "Spanish La Liga", "La Liga",
+  "Italian Serie A", "Serie A", "German Bundesliga", "Bundesliga",
+  "French Ligue 1", "Ligue 1", "Dutch Eredivisie", "Eredivisie",
+  "Portuguese Primeira Liga", "Primeira Liga", "Major League Soccer", "MLS"
 ];
+
 async function resolveSoccerLeagueIdsByName(names = BIG_SOCCER_NAMES) {
   const k = "META:SOCCER:LEAGUE_IDS";
   const hit = getC(k); if (hit) return hit;
   const j = await memoJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/search_all_leagues.php?s=Soccer`, TTL.META);
   const arr = Array.isArray(j?.countrys) ? j.countrys : [];
   const want = new Set(names.map(s => s.toLowerCase()));
-  const ids = [];
+  let ids = [];
   for (const row of arr) {
     const name = (row.strLeague || "").toLowerCase();
     if (want.has(name)) ids.push(parseInt(row.idLeague, 10));
   }
-  console.log("[meta] soccer big-league ids:", ids.join(", "));
+  if (!ids.length) {
+    console.warn("[meta] resolve failed or empty; using hardcoded soccer IDs:", HARDCODED_SOCCER_IDS.join(", "));
+    ids = HARDCODED_SOCCER_IDS.slice();
+  } else {
+    console.log("[meta] soccer big-league ids:", ids.join(", "));
+  }
   setC(k, ids, TTL.META);
   return ids;
 }
-async function getSoccerBigLeagues(n) {
-  const ids = await resolveSoccerLeagueIdsByName();
+
+async function getSoccerBigLeagues(n, ids) {
+  const leagueIds = Array.isArray(ids) && ids.length ? ids : await resolveSoccerLeagueIdsByName();
   const merged = [];
-  for (const id of ids) {
+  const per = [];
+  for (const id of leagueIds) {
     const items = await getLeagueMatchesCached("soccer", id, n);
+    per.push(`${id}:${items.length}`);
     for (const m of items) pushUnique(merged, m);
   }
+  console.log(`[soccer agg] perLeague {${per.join(", ")}} merged=${merged.length}`);
   merged.sort(sortForDisplay);
   return merged.slice(0, n);
 }
@@ -282,12 +283,13 @@ const CONFIGS = {
   "/scores/nhl":    { sport: "ice_hockey",        leagueId: 4380 },
 };
 
-// Multi-league soccer
+// Multi-league soccer (supports manual ids override via ?ids=4328,4335,...)
 app.get("/scores/soccer", async (req, res) => {
   try {
     const n = Math.max(5, Math.min(20, parseInt(req.query.n || DEFAULT_COUNT, 10) || DEFAULT_COUNT));
-    const items = await getSoccerBigLeagues(n);
-    console.log(`/scores/soccer → ${items.length} items (n=${n})`);
+    const ids = (req.query.ids ? String(req.query.ids).split(",").map(x => parseInt(x, 10)).filter(Boolean) : null);
+    const items = await getSoccerBigLeagues(n, ids);
+    console.log(`/scores/soccer ids=${ids ? ids.join(",") : "auto"} → ${items.length} items (n=${n})`);
     res.json(items.map(formatMatch));
   } catch (e) {
     console.error("/scores/soccer handler error:", e);
@@ -310,15 +312,36 @@ for (const [path, cfg] of Object.entries(CONFIGS)) {
   });
 }
 
+// Test helpers
+app.get("/scores/epl", async (req, res) => {
+  try {
+    const n = Math.max(5, Math.min(20, parseInt(req.query.n || DEFAULT_COUNT, 10) || DEFAULT_COUNT));
+    const items = await getLeagueMatchesCached("soccer", 4328, n);
+    console.log(`/scores/epl → ${items.length} items (n=${n})`);
+    res.json(items.map(formatMatch));
+  } catch (e) { res.status(500).json({ error: "internal" }); }
+});
+
+app.get("/demo/soccer", (_req, res) => {
+  const now = Math.floor(Date.now()/1000);
+  const iso = (t)=>new Date(t*1000).toISOString();
+  const rows = [
+    { league:"English Premier League", team1:"Arsenal", team2:"Chelsea",  score1:"N/A", score2:"N/A", status:"Scheduled", start: iso(now+3600) },
+    { league:"Spanish La Liga",       team1:"Real Madrid", team2:"Sevilla", status:"LIVE", isLive:true, score1:"1", score2:"0", start: iso(now-1200) },
+    { league:"Italian Serie A",       team1:"Inter", team2:"Napoli",  status:"Scheduled", start: iso(now+7200) },
+    { league:"German Bundesliga",     team1:"Bayern", team2:"Dortmund", status:"Final", score1:"2", score2:"1", start: iso(now-7800) },
+  ];
+  console.log("[/demo/soccer] rows=", rows.length);
+  res.json(rows);
+});
+
 // Diag / health
 app.get("/health", (_, res) => res.json({ ok: true }));
 app.get("/diag", async (_req, res) => {
   try {
     const ids = await resolveSoccerLeagueIdsByName();
     res.json({ build: BUILD, haveV1Key: !!V1_KEY, haveV2Key: !!V2_KEY, soccerLeagueIds: ids });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, () => console.log(`Server listening on ${PORT} — ${BUILD}`));
