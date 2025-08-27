@@ -3,7 +3,7 @@ const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ v6 (n-items + preseason + start + sort)";
+const BUILD = "SportsHQ v7 (multi-soccer + status/isLive + robust live)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 // Polyfill
@@ -18,7 +18,7 @@ if (!V2_KEY) console.error("❌ Missing TSDB_V2_KEY");
 if (!V1_KEY) console.warn("⚠️ Missing TSDB_V1_KEY");
 
 const DEFAULT_COUNT = 10; // how many rows per board by default
-const TTL = { LIVE:15e3, NEXT:5*60e3, SEASON:3*60*60e3, DAY:30*60e3, PAST:10*60e3, OUT:25e3 };
+const TTL = { LIVE:15e3, NEXT:5*60e3, SEASON:3*60*60e3, DAY:30*60e3, PAST:10*60e3, OUT:25e3, META:12*60*60e3 };
 
 const COMMON_HEADERS = { "User-Agent":"SportsHQ/1.0 (+render.com)", "Accept":"application/json" };
 
@@ -50,7 +50,7 @@ function toMillis(dateStr, timeStr){
   if(!dateStr) return NaN;
   const t = cleanTime(timeStr);
   const hasTZ = /[zZ]$|[+\-]\d\d:?\d\d$/.test(t);
-  const ms = Date.parse(`${dateStr}T${t}${hasTZ?"":"Z"}`);
+  const ms = Date.parse(`${dateStr}T${t}${hasTZ?"":"Z"}`); // UTC default
   return Number.isNaN(ms)?NaN:ms;
 }
 function eventMillis(m){
@@ -63,14 +63,15 @@ function eventMillis(m){
   return NaN;
 }
 function pickScore(v){ return (v===undefined||v===null||v===""||v==="N/A")?null:v; }
-function isLiveWord(s=""){ const t=(s+"").toLowerCase(); return t.includes("live")||t.includes("in play")||/^q\d/.test(t)||t.includes("quarter")||t.includes("ot")||t.includes("overtime")||t.includes("half")||t==="ht"; }
+function isLiveWord(s=""){ const t=(s+"").toLowerCase(); return t.includes("live")||t.includes("in play")||/^q\d/.test(t)||t.includes("quarter")||t.includes("ot")||t.includes("overtime")||t.includes("half")||t==="ht" || t==="1h" || t==="2h"; }
 function isFinalWord(s=""){ const t=(s+"").toLowerCase(); return t.includes("final")||t==="ft"||t.includes("full time"); }
+// CHANGED: if it's live-looking, return LIVE even if scores are missing
 function normalizeStatus(m,s1,s2){
   const raw=String(m.strStatus||m.strProgress||"").trim();
-  const hasScore=(s1!==null)||(s2!==null);
   if (isFinalWord(raw)) return "Final";
-  if (isLiveWord(raw))  return hasScore ? "LIVE" : "Scheduled";
+  if (isLiveWord(raw))  return "LIVE";
   if (!raw||raw==="NS"||raw.toLowerCase()==="scheduled"||raw.toLowerCase()==="preview") return "Scheduled";
+  const hasScore=(s1!==null)||(s2!==null);
   return hasScore ? raw : "Scheduled";
 }
 const FINAL_KEEP_MS = 15*60*1000;
@@ -98,7 +99,7 @@ function leagueMatch(m, leagueId, sport){
   if (sport==="american_football") return idOk || name.includes("nfl");
   if (sport==="basketball")        return idOk; // NBA only (leagueId 4387)
   if (sport==="ice_hockey")        return idOk || name.includes("nhl");
-  return idOk; // soccer EPL stays strict
+  return idOk; // soccer: used when we call per-league; multi-league handled separately
 }
 
 // Fetchers (memoized)
@@ -149,21 +150,21 @@ async function fillByDaysUntil(out, sport, leagueId, n, maxWeeks=6){
   }
 }
 
-// Build list
+// Build list for one league
 async function getLeagueMatchesCore(sport, leagueId, n){
   const out=[];
 
   // 1) LIVE
   const live=await v2Livescore(sport);
   for (const m of live||[]){ if (!leagueMatch(m, leagueId, sport)) continue; if (isOldFinal(m)) continue; pushUnique(out,m); }
-  console.log(`[live] ${sport} -> ${out.length}`);
+  console.log(`[live] ${sport}/${leagueId} -> ${out.length}`);
 
   // 2) NEXT
   if (out.length<n){
     const e=await v1NextLeague(leagueId);
     e.sort((a,b)=>eventMillis(a)-eventMillis(b));
     for (const m of e){ if (out.length>=n) break; if (!leagueMatch(m, leagueId, sport)) continue; pushUnique(out,m); }
-    console.log(`[next v1] ${sport} -> ${out.length}/${n}`);
+    console.log(`[next v1] ${sport}/${leagueId} -> ${out.length}/${n}`);
   }
 
   // 3) SEASON (future only)
@@ -174,7 +175,7 @@ async function getLeagueMatchesCore(sport, leagueId, n){
       const fut=e.filter(x=>leagueMatch(x,leagueId,sport) && isFinite(eventMillis(x)) && eventMillis(x)>=now)
                  .sort((a,b)=>eventMillis(a)-eventMillis(b));
       for (const m of fut){ if (out.length>=n) break; pushUnique(out,m); }
-      console.log(`[season ${s}] ${sport} -> ${out.length}/${n}`);
+      console.log(`[season ${s}] ${sport}/${leagueId} -> ${out.length}/${n}`);
       if (out.length>=n) break;
     }
   }
@@ -187,12 +188,11 @@ async function getLeagueMatchesCore(sport, leagueId, n){
     const e=await v1PastLeague(leagueId);
     e.sort((a,b)=>eventMillis(b)-eventMillis(a));
     for (const m of e){ if (out.length>=n) break; if (!leagueMatch(m,leagueId,sport)) continue; m.strStatus=m.strStatus||"Final"; if (isOldFinal(m)) continue; pushUnique(out,m); }
-    console.log(`[past recent] ${sport} -> ${out.length}/${n}`);
+    console.log(`[past recent] ${sport}/${leagueId} -> ${out.length}/${n}`);
   }
 
   // Sort for display
   out.sort(sortForDisplay);
-
   return out.slice(0,n);
 }
 
@@ -205,30 +205,83 @@ async function getLeagueMatchesCached(sport, leagueId, n){
   return data;
 }
 
-// Format output (includes ISO start)
+// --- NEW: resolve soccer league IDs by league names (once, cached) ---
+const BIG_SOCCER_NAMES = [
+  "English Premier League",
+  "Spanish La Liga",
+  "Italian Serie A",
+  "German Bundesliga",
+  "French Ligue 1",
+  "Dutch Eredivisie",
+  "Portuguese Primeira Liga",
+  "Major League Soccer"
+];
+async function resolveSoccerLeagueIdsByName(names=BIG_SOCCER_NAMES){
+  const k="META:SOCCER:LEAGUE_IDS";
+  const hit = getC(k); if (hit) return hit;
+  const j=await memoJson(`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/search_all_leagues.php?s=Soccer`, TTL.META);
+  const arr = Array.isArray(j?.countrys)? j.countrys : [];
+  const want = new Set(names.map(s=>s.toLowerCase()));
+  const ids = [];
+  for (const row of arr){
+    const name=(row.strLeague||"").toLowerCase();
+    if (want.has(name)) ids.push(parseInt(row.idLeague,10));
+  }
+  console.log("[meta] soccer big-league ids:", ids.join(", "));
+  setC(k, ids, TTL.META);
+  return ids;
+}
+
+// --- NEW: aggregate many soccer leagues and return top n ---
+async function getSoccerBigLeagues(n){
+  const ids = await resolveSoccerLeagueIdsByName();
+  const merged = [];
+  for (const id of ids){
+    const items = await getLeagueMatchesCached("soccer", id, n);
+    for (const m of items) pushUnique(merged, m);
+  }
+  merged.sort(sortForDisplay);
+  return merged.slice(0, n);
+}
+
+// Format output (now includes league, status, isLive)
 function formatMatch(m){
   const home=m.strHomeTeam||m.homeTeam||m.strHome||"";
   const away=m.strAwayTeam||m.awayTeam||m.strAway||"";
   const s1=pickScore(m.intHomeScore??m.intHomeGoals);
   const s2=pickScore(m.intAwayScore??m.intAwayGoals);
-  const status=normalizeStatus(m,s1,s2);
+  const status=computedStatus(m);
   const ms=eventMillis(m);
   return {
-    team1:home, team2:away,
-    score1:s1===null?"N/A":String(s1),
-    score2:s2===null?"N/A":String(s2),
-    headline:`${home} vs ${away} - ${status}`,
-    start:isFinite(ms)?new Date(ms).toISOString():null
+    league: m.strLeague || "",
+    team1: home, team2: away,
+    score1: s1===null?"N/A":String(s1),
+    score2: s2===null?"N/A":String(s2),
+    status, isLive: status==="LIVE",
+    headline: `${home} vs ${away} - ${status}`,
+    start: isFinite(ms)?new Date(ms).toISOString():null
   };
 }
 
 // Endpoints
 const CONFIGS = {
-  "/scores/soccer": { sport:"soccer",            leagueId:4328 },
+  // soccer is now MULTI-league; nba/nfl/nhl unchanged
   "/scores/nba":    { sport:"basketball",        leagueId:4387 },
   "/scores/nfl":    { sport:"american_football", leagueId:4391 },
   "/scores/nhl":    { sport:"ice_hockey",        leagueId:4380 },
 };
+
+// Multi-league soccer endpoint
+app.get("/scores/soccer", async (req,res)=>{
+  try{
+    const n = Math.max(5, Math.min(20, parseInt(req.query.n || DEFAULT_COUNT, 10) || DEFAULT_COUNT));
+    const items = await getSoccerBigLeagues(n);
+    console.log(`/scores/soccer → ${items.length} items (n=${n})`);
+    res.json(items.map(formatMatch));
+  }catch(e){ console.error("/scores/soccer handler error:",e); res.status(500).json({error:"internal"}); }
+});
+
+// Single-league endpoints as before
 for (const [path,cfg] of Object.entries(CONFIGS)){
   app.get(path, async (req,res)=>{
     try{
