@@ -1,11 +1,11 @@
-// server.js — v14: Season-first filling (guarantee up to 10 rows),
-// EPL-only soccer, resilient cache/backoff, light fallbacks.
+// server.js — v15: season-first fill (guarantee 10 rows), finals ≤15m → live → scheduled,
+// EPL-only soccer, 429-resilient SWR caching, minimal/ throttled fallbacks.
 
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ v14 (season-first fill + EPL-only + 10 rows)";
+const BUILD = "SportsHQ v15 (season-first + finals/live/scheduled + low-load)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 // Polyfill fetch (Node < 18)
@@ -13,26 +13,26 @@ if (typeof fetch !== "function") {
   global.fetch = (...args) => import("node-fetch").then(m => m.default(...args));
 }
 
-// === ENV ===
-const V2_KEY = process.env.TSDB_V2_KEY || ""; // header for v2 livescore (optional)
-const V1_KEY = process.env.TSDB_V1_KEY || ""; // v1 key in path (uses "3" if blank)
+// --- ENV ---
+const V2_KEY = process.env.TSDB_V2_KEY || ""; // header for v2
+const V1_KEY = process.env.TSDB_V1_KEY || ""; // key in v1 URL path (falls back to "3" test key)
 if (!V2_KEY) console.warn("ℹ️ TSDB_V2_KEY missing (live may be limited)");
 if (!V1_KEY) console.warn("ℹ️ TSDB_V1_KEY missing; using shared/test key");
 
-// === CONFIG ===
-const DEFAULT_COUNT = 10;
+// --- CONFIG ---
+const DEFAULT_COUNT = 10; // 10 rows per screen
 
 const TTL = {
   LIVE:   15_000,          // 15s
-  NEXT:   5 * 60_000,      // 5m
-  SEASON: 6 * 60 * 60_000, // 6h (big payload; cache long)
-  DAY:    30 * 60_000,     // 30m
+  SEASON: 6 * 60 * 60_000, // 6h
   PAST:   10 * 60_000,     // 10m
-  OUT:    60_000,          // 60s merged list
+  DAY:    30 * 60_000,     // 30m
+  OUT:    60_000,          // 60s list cache (SWR)
 };
-const SWR_EXTRA = 5 * 60_000;
+const SWR_EXTRA = 5 * 60_000; // serve-stale-while-revalidate 5m
 
-const DAY_TOKENS_MAX = 6;      // gentle cap on eventsday calls
+// Throttle for eventsday scans (global token bucket)
+const DAY_TOKENS_MAX = 8;
 const DAY_TOKENS_REFILL_MS = 15_000;
 let DAY_TOKENS = DAY_TOKENS_MAX;
 setInterval(() => { DAY_TOKENS = Math.min(DAY_TOKENS_MAX, DAY_TOKENS + 1); }, DAY_TOKENS_REFILL_MS);
@@ -41,21 +41,21 @@ const COMMON_HEADERS = { "User-Agent":"SportsHQ/1.0 (+render.com)", "Accept":"ap
 const sleep  = ms => new Promise(r => setTimeout(r, ms));
 const jitter = ms => ms + Math.floor(Math.random() * (ms/3));
 
-// === SWR cache + in-flight dedupe ===
-const cache = new Map();    // key -> {val,exp,swr}
+// --- SWR cache + in-flight dedupe ---
+const cache = new Map();    // key -> { val, exp, swr }
 const inflight = new Map(); // key -> Promise
 
 function getCache(key){
   const e = cache.get(key);
   if (!e) return {hit:false};
   const now = Date.now();
-  if (now <= e.exp) return {hit:true,fresh:true,val:e.val};
-  if (now <= e.swr) return {hit:true,fresh:false,val:e.val};
+  if (now <= e.exp) return {hit:true, fresh:true,  val:e.val};
+  if (now <= e.swr) return {hit:true, fresh:false, val:e.val};
   return {hit:false};
 }
 function setCache(key,val,ttl){
   const now = Date.now();
-  cache.set(key,{val,exp:now+ttl,swr:now+ttl+SWR_EXTRA});
+  cache.set(key, { val, exp: now + ttl, swr: now + ttl + SWR_EXTRA });
 }
 async function withInflight(key, fn){
   if (inflight.has(key)) return inflight.get(key);
@@ -63,24 +63,24 @@ async function withInflight(key, fn){
   inflight.set(key,p); return p;
 }
 
-// === fetch with backoff ===
-async function fetchJsonRetry(url, extra={}, tries=4, baseDelay=600){
+// --- fetch with retry/backoff ---
+async function fetchJsonRetry(url, extra={}, tries=4, baseDelay=650){
   let lastErr;
   for (let i=0;i<tries;i++){
     try{
       const res = await fetch(url, { headers: { ...COMMON_HEADERS, ...extra } });
       const txt = await res.text();
-      if (res.status === 429){
+      if (res.status === 429) {
         const ra = Number(res.headers?.get("retry-after")) || 0;
-        const wait = jitter(ra ? ra*1000 : baseDelay*Math.pow(2,i));
+        const wait = jitter(ra ? ra*1000 : baseDelay * Math.pow(2,i));
         console.warn(`[429] wait ${wait}ms :: ${url}`);
         await sleep(wait); continue;
       }
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText} | ${txt.slice(0,160)}`);
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText} | ${txt.slice(0,180)}`);
       return JSON.parse(txt);
     }catch(e){
       lastErr = e;
-      const wait = jitter(baseDelay*Math.pow(2,i));
+      const wait = jitter(baseDelay * Math.pow(2,i));
       console.warn(`[retry] ${e.message}; wait ${wait}ms :: ${url}`);
       await sleep(wait);
     }
@@ -98,12 +98,11 @@ async function memoJson(url, ttl, extra={}){
     if (j) setCache(key, j, ttl);
     return j || c.val || null;
   };
-
   if (c.hit && !c.fresh){ withInflight(key, fetcher); return c.val; }
   return withInflight(key, fetcher);
 }
 
-// === time / status ===
+// --- time / status helpers ---
 function cleanTime(t){ if(!t) return "00:00:00"; const s=String(t).trim(); return (/^tba$|^tbd$/i.test(s))?"00:00:00":s; }
 function toMillis(d,t){ if(!d) return NaN; const tt=cleanTime(t); const hasTZ=/[zZ]$|[+\-]\d\d:?\d\d$/.test(tt); const ms=Date.parse(`${d}T${tt}${hasTZ?"":"Z"}`); return Number.isNaN(ms)?NaN:ms; }
 function eventMillis(m){
@@ -111,8 +110,8 @@ function eventMillis(m){
   ms = toMillis(m.dateEventLocal||m.dateEvent, m.strTimeLocal||m.strTime); if (!Number.isNaN(ms)) return ms;
   if (m.strTimestampMS){ const n=+m.strTimestampMS; if (!Number.isNaN(n)) return n; }
   if (m.strTimestamp){ const n=+m.strTimestamp*1000; if (!Number.isNaN(n)) return n; }
-  if (m.dateEvent){ ms=toMillis(m.dateEvent,"00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
-  if (m.dateEventLocal){ ms=toMillis(m.dateEventLocal,"00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
+  if (m.dateEvent){ ms = toMillis(m.dateEvent,"00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
+  if (m.dateEventLocal){ ms = toMillis(m.dateEventLocal,"00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
   return NaN;
 }
 function pickScore(v){ return (v===undefined||v===null||v===""||v==="N/A")?null:v; }
@@ -126,77 +125,73 @@ function normalizeStatus(m,s1,s2){
   return has ? raw : "Scheduled";
 }
 const FINAL_KEEP_MS = 15*60*1000;
-function isOldFinal(m){ const t=eventMillis(m); if(Number.isNaN(t)) return false; const raw=m.strStatus||m.strProgress||""; return isFinalWord(raw) && (Date.now()-t)>FINAL_KEEP_MS; }
-function computedStatus(m){ const s1=pickScore(m.intHomeScore??m.intHomeGoals), s2=pickScore(m.intAwayScore??m.intAwayGoals); return normalizeStatus(m,s1,s2); }
+function isRecentFinal(m){
+  const raw = m.strStatus || m.strProgress || "";
+  if (!isFinalWord(raw)) return false;
+  const ms = eventMillis(m);
+  if (!isFinite(ms)) return false;
+  return (Date.now() - ms) <= FINAL_KEEP_MS;
+}
+function computedStatus(m){
+  const s1=pickScore(m.intHomeScore??m.intHomeGoals), s2=pickScore(m.intAwayScore??m.intAwayGoals);
+  return normalizeStatus(m,s1,s2);
+}
 function matchKey(m){ return m.idEvent || `${m.strHomeTeam}|${m.strAwayTeam}|${m.dateEvent||m.dateEventLocal||""}`; }
 function pushUnique(arr,m){ const k=matchKey(m); if(!arr.some(x=>matchKey(x)===k)) arr.push(m); }
+
+// Our final ordering: Finals (newest first) → Live (soonest) → Scheduled (soonest)
 function sortForDisplay(a,b){
   const sa=computedStatus(a), sb=computedStatus(b);
-  const pa=(sa==="Final")?0:(sa==="LIVE")?1:2, pb=(sb==="Final")?0:(sb==="LIVE")?1:2;
-  if (pa!==pb) return pa-pb;
+  const rank = s => (s==="Final")?0 : (s==="LIVE")?1 : 2;
+  const ra=rank(sa), rb=rank(sb);
+  if (ra!==rb) return ra-rb;
   const ta=eventMillis(a), tb=eventMillis(b);
   const aBad=!isFinite(ta), bBad=!isFinite(tb);
-  if (aBad && !bBad) return +1; if (!aBad && bBad) return -1;
-  if (pa===0) return tb-ta; // newest finals first
-  return ta-tb;            // soonest live/scheduled first
+  if (aBad && !bBad) return +1;
+  if (!aBad && bBad) return -1;
+  if (ra===0) return tb-ta; // Finals: newest first
+  return ta-tb;             // Live/Scheduled: soonest first
 }
 
-// === TSDB wrappers ===
+// --- TSDB wrappers ---
 async function v2Livescore(sport){
   const s=sport.replace(/_/g," ");
-  const urls=[
+  const urls = [
     `https://www.thesportsdb.com/api/v2/json/livescore/${encodeURIComponent(s)}`,
     `https://www.thesportsdb.com/api/v2/json/livescore.php?s=${encodeURIComponent(s)}`
   ];
-  const out=[];
-  for (const u of urls){
-    const j=await memoJson(u, TTL.LIVE, V2_KEY ? {"X-API-KEY":V2_KEY} : {});
+  const out=[]; for (const u of urls){
+    const j = await memoJson(u, TTL.LIVE, V2_KEY ? {"X-API-KEY":V2_KEY} : {});
     if (j?.livescore?.length) out.push(...j.livescore);
   }
   return out;
 }
-const V1 = (path) => `https://www.thesportsdb.com/api/v1/json/${V1_KEY || "3"}/${path}`;
-async function v1NextLeague(id){ const j=await memoJson(V1(`eventsnextleague.php?id=${id}`), TTL.NEXT); return Array.isArray(j?.events)?j.events:[]; }
+const V1 = (p) => `https://www.thesportsdb.com/api/v1/json/${V1_KEY || "3"}/${p}`;
 async function v1Season(id,s){ const j=await memoJson(V1(`eventsseason.php?id=${id}&s=${encodeURIComponent(s)}`), TTL.SEASON); return Array.isArray(j?.events)?j.events:[]; }
 async function v1PastLeague(id){ const j=await memoJson(V1(`eventspastleague.php?id=${id}`), TTL.PAST); return Array.isArray(j?.events)?j.events:[]; }
-const SPORT_LABEL={ soccer:"Soccer", basketball:"Basketball", american_football:"American Football", ice_hockey:"Ice Hockey" };
 async function v1EventsDay(sport, ymd){
   if (DAY_TOKENS <= 0) { console.warn(`[DAY throttle] skip ${sport} ${ymd}`); return []; }
   DAY_TOKENS--;
-  const label=SPORT_LABEL[sport]||sport;
+  const label = { soccer:"Soccer", basketball:"Basketball", american_football:"American Football", ice_hockey:"Ice Hockey" }[sport] || sport;
   const j=await memoJson(V1(`eventsday.php?d=${ymd}&s=${encodeURIComponent(label)}`), TTL.DAY);
   return Array.isArray(j?.events)?j.events:[];
 }
 
-// === seasons ===
+// --- seasons ---
 function guessSeasonCrossYear(){
   const d=new Date(), y=d.getUTCFullYear(), m=d.getUTCMonth()+1;
-  const start=(m>=7)?y:y-1;
+  const start = (m>=7)? y : y-1;
   return `${start}-${start+1}`;
 }
-function nextCross(str){ const a=parseInt(str.split("-")[0],10); return `${a+1}-${a+2}`; }
-function prevCross(str){ const a=parseInt(str.split("-")[0],10); return `${a-1}-${a}`; }
-function seasonCandidatesEPL(){
-  const cross=guessSeasonCrossYear();
-  return [cross, nextCross(cross), prevCross(cross)];
-}
-function seasonCandidatesSingle(sport, leagueId){
-  const d=new Date(), y=d.getUTCFullYear();
-  const cross=guessSeasonCrossYear(), crossPrev=prevCross(cross), crossNext=nextCross(cross);
-  if (sport==="american_football" || leagueId===4391){
-    // NFL: include current & next single-year too
-    return [String(y), String(y+1), cross, crossPrev];
-  }
-  if (sport==="basketball" || leagueId===4387){
-    return [cross, crossNext, crossPrev, String(y)];
-  }
-  if (sport==="ice_hockey" || leagueId===4380){
-    return [cross, crossNext, crossPrev, String(y)];
-  }
-  return [cross, String(y)];
-}
+function nextCross(s){ const a=parseInt(s.split("-")[0],10); return `${a+1}-${a+2}`; }
+function prevCross(s){ const a=parseInt(s.split("-")[0],10); return `${a-1}-${a}`; }
 
-// === output shape ===
+function seasonsEPL(){ const c=guessSeasonCrossYear(); return [c, nextCross(c), prevCross(c)]; }
+function seasonsNFL(){ const y=(new Date()).getUTCFullYear(); const c=guessSeasonCrossYear(); return [String(y), String(y+1), c, prevCross(c)]; }
+function seasonsNBA(){ const c=guessSeasonCrossYear(); return [c, nextCross(c), prevCross(c)]; }
+function seasonsNHL(){ const c=guessSeasonCrossYear(); return [c, nextCross(c), prevCross(c)]; }
+
+// --- formatter ---
 function formatMatch(m){
   const home=m.strHomeTeam||m.homeTeam||m.strHome||"";
   const away=m.strAwayTeam||m.awayTeam||m.strAway||"";
@@ -208,155 +203,109 @@ function formatMatch(m){
            headline:`${home} vs ${away} - ${status}`, start:isFinite(ms)?new Date(ms).toISOString():null };
 }
 
-// === builders (season-first) ===
-const EPL = 4328;
+// --- core builder (season-first) ---
+async function buildLeague({ sport, leagueId, seasons, n }){
+  const finals=[], live=[], sched=[];
+  const now = Date.now();
 
-async function fillFromSeasons(out, leagueId, seasons, n, sport){
-  for (const s of seasons){
-    const rows = await v1Season(leagueId, s);
-    const fut = (rows||[])
-      .filter(m => String(m.idLeague||"")===String(leagueId) && isFinite(eventMillis(m)) && eventMillis(m)>=Date.now())
-      .sort((a,b)=>eventMillis(a)-eventMillis(b));
-    for (const m of fut){ if (out.length>=n) break; pushUnique(out,m); }
-    if (out.length>=n) break;
-  }
-}
+  // A) Recent finals (≤15m)
+  try{
+    const past = await v1PastLeague(leagueId);
+    for (const m of (past||[])){
+      if (isRecentFinal(m)) pushUnique(finals, m);
+    }
+    finals.sort((a,b)=>eventMillis(b)-eventMillis(a)); // newest first
+  }catch(e){ console.warn(`[past fail] ${leagueId}`, e?.message); }
 
-async function buildSoccerEPL(n){
-  const out=[];
+  // B) LIVE (sport-wide call, filtered)
+  try{
+    const ls = await v2Livescore(sport);
+    for (const m of (ls||[])){
+      if (String(m.idLeague||"") === String(leagueId) && !isRecentFinal(m)) pushUnique(live, m);
+    }
+    // live rows will be naturally time-ordered by sortForDisplay later
+  }catch(e){ console.warn(`[live fail] ${sport}`, e?.message); }
 
-  // 0) LIVE (cheap; prepend if any)
-  const live = await v2Livescore("soccer");
-  for (const m of live||[]) if (String(m.idLeague||"")===String(EPL) && !isOldFinal(m)) pushUnique(out,m);
+  // C) SEASON-FIRST future schedule (cheap + big fill)
+  try{
+    for (const s of seasons){
+      const rows = await v1Season(leagueId, s);
+      const fut = (rows||[])
+        .filter(m => {
+          const ms = eventMillis(m);
+          return isFinite(ms) && ms >= now; // future only
+        })
+        .sort((a,b)=>eventMillis(a)-eventMillis(b));
+      for (const m of fut){
+        if (finals.length + live.length + sched.length >= n) break;
+        pushUnique(sched, m);
+      }
+      if (finals.length + live.length + sched.length >= n) break;
+    }
+  }catch(e){ console.warn(`[season fail] ${leagueId}`, e?.message); }
 
-  // 1) SEASON-FIRST: current → next → prev
-  await fillFromSeasons(out, EPL, seasonCandidatesEPL(), n, "soccer");
-
-  // 2) NEXT (usually overlaps; push uniques if still short)
-  if (out.length<n){
-    const next = (await v1NextLeague(EPL))
-      .sort((a,b)=>eventMillis(a)-eventMillis(b));
-    for (const m of next){ if (out.length>=n) break; if (String(m.idLeague||"")!==String(EPL)) continue; const ms=eventMillis(m); if (!isFinite(ms)||ms<Date.now()) continue; pushUnique(out,m); }
-  }
-
-  // 3) Minimal day scan (≤ 10 calls total across service via token bucket)
-  if (out.length<n){
-    const today=new Date();
-    outer: for (let d=0; d<14; d++){ // 2 weeks
-      const ymd=new Date(today.getTime()+d*86400000).toISOString().slice(0,10);
-      const rows = await v1EventsDay("soccer", ymd);
-      for (const m of rows||[]){
-        if (out.length>=n) break outer;
-        if (String(m.idLeague||"")!==String(EPL)) continue;
-        const ms=eventMillis(m); if (!isFinite(ms) || ms<Date.now()) continue;
-        pushUnique(out,m);
+  // D) Light day scan (up to 14 days, but globally throttled)
+  let total = finals.length + live.length + sched.length;
+  if (total < n){
+    const today = new Date();
+    outer: for (let d=0; d<14; d++){
+      const ymd = new Date(today.getTime()+d*86400000).toISOString().slice(0,10);
+      const rows = await v1EventsDay(sport, ymd);
+      const fut  = (rows||[]).filter(m => {
+        if (String(m.idLeague||"") !== String(leagueId)) return false;
+        const ms = eventMillis(m);
+        return isFinite(ms) && ms >= now;
+      }).sort((a,b)=>eventMillis(a)-eventMillis(b));
+      for (const m of fut){
+        if (finals.length + live.length + sched.length >= n) break outer;
+        pushUnique(sched, m);
       }
     }
   }
 
-  // 4) Recent finals if still short
-  if (out.length<n){
-    const past=(await v1PastLeague(EPL)).sort((a,b)=>eventMillis(b)-eventMillis(a));
-    for (const m of past){
-      if (out.length>=n) break;
-      m.strStatus=m.strStatus||"Final";
-      if (!isOldFinal(m)) pushUnique(out,m);
-    }
-  }
-
-  out.sort(sortForDisplay);
-  return out.slice(0,n);
+  // E) Merge in correct order and cut to n
+  const merged = [...finals, ...live, ...sched].sort(sortForDisplay).slice(0, n);
+  return merged;
 }
 
-function leagueMatch(m, leagueId, sport){
-  const idOk = String(m.idLeague||"")===String(leagueId);
-  const name = String(m.strLeague||"").toLowerCase();
-  if (sport==="american_football") return idOk || name.includes("nfl");
-  if (sport==="basketball")        return idOk;
-  if (sport==="ice_hockey")        return idOk || name.includes("nhl");
-  return idOk;
-}
-
-async function buildSingle(sport, leagueId, n){
-  const out=[];
-
-  // 0) LIVE
-  const live=await v2Livescore(sport);
-  for (const m of live||[]) if (leagueMatch(m,leagueId,sport) && !isOldFinal(m)) pushUnique(out,m);
-
-  // 1) SEASON-FIRST: current → next cross → prev (or single years for NFL)
-  await fillFromSeasons(out, leagueId, seasonCandidatesSingle(sport, leagueId), n, sport);
-
-  // 2) NEXT
-  if (out.length<n){
-    const e=(await v1NextLeague(leagueId)).sort((a,b)=>eventMillis(a)-eventMillis(b));
-    for (const m of e){ if (out.length>=n) break; if (!leagueMatch(m,leagueId,sport)) continue; const ms=eventMillis(m); if (!isFinite(ms)||ms<Date.now()) continue; pushUnique(out,m); }
-  }
-
-  // 3) Short day window (7 days)
-  if (out.length<n){
-    const today=new Date();
-    outer: for (let d=0; d<7; d++){
-      const ymd=new Date(today.getTime()+d*86400000).toISOString().slice(0,10);
-      const rows=await v1EventsDay(sport, ymd);
-      for (const m of rows||[]){
-        if (out.length>=n) break outer;
-        if (!leagueMatch(m,leagueId,sport)) continue;
-        const ms=eventMillis(m); if (!isFinite(ms)||ms<Date.now()) continue;
-        pushUnique(out,m);
-      }
-    }
-  }
-
-  // 4) Recent finals
-  if (out.length<n){
-    const p=(await v1PastLeague(leagueId)).sort((a,b)=>eventMillis(b)-eventMillis(a));
-    for (const m of p){
-      if (out.length>=n) break;
-      if (!leagueMatch(m,leagueId,sport)) continue;
-      m.strStatus=m.strStatus||"Final";
-      if (!isOldFinal(m)) pushUnique(out,m);
-    }
-  }
-
-  out.sort(sortForDisplay);
-  return out.slice(0,n);
-}
-
-// === cached wrappers ===
-async function getSoccerEPL(n){
-  const key=`OUT:soccer_epl:${n}`;
-  const c=getCache(key);
+// --- cached wrappers per board ---
+async function getBoardCached(key, builder, ttl = TTL.OUT){
+  const c = getCache(key);
   if (c.hit && c.fresh) return c.val;
-  const fetcher=async()=>{ const data=await buildSoccerEPL(n); setCache(key,data,TTL.OUT); return data; };
-  if (c.hit && !c.fresh){ withInflight(key, fetcher); return c.val; }
-  return withInflight(key, fetcher);
-}
-async function getSingleCached(sport, leagueId, n){
-  const key=`OUT:${sport}:${leagueId}:${n}`;
-  const c=getCache(key);
-  if (c.hit && c.fresh) return c.val;
-  const fetcher=async()=>{ const data=await buildSingle(sport,leagueId,n); setCache(key,data,TTL.OUT); return data; };
+  const fetcher = async()=>{ const data = await builder(); setCache(key, data, ttl); return data; };
   if (c.hit && !c.fresh){ withInflight(key, fetcher); return c.val; }
   return withInflight(key, fetcher);
 }
 
-// === routes ===
+// --- leagues ---
+const L = {
+  EPL: 4328,
+  NBA: 4387,
+  NFL: 4391,
+  NHL: 4380,
+};
+
+// --- routes (EPL-only soccer) ---
 app.get("/scores/soccer", async (req,res)=>{
   try{
-    const n=Math.max(5, Math.min(10, parseInt(req.query.n || DEFAULT_COUNT,10) || DEFAULT_COUNT));
-    const items=await getSoccerEPL(n);
+    const n = Math.max(5, Math.min(10, parseInt(req.query.n || DEFAULT_COUNT, 10) || DEFAULT_COUNT));
+    const items = await getBoardCached(`OUT:soccer:${n}`, () =>
+      buildLeague({ sport:"soccer", leagueId:L.EPL, seasons: seasonsEPL(), n })
+    );
     res.json(items.map(formatMatch));
   }catch(e){ console.error("soccer error:",e); res.status(500).json({error:"internal"}); }
 });
-app.get("/scores/nba", async (req,res)=>serveSingle(req,res,"basketball",        4387));
-app.get("/scores/nfl", async (req,res)=>serveSingle(req,res,"american_football", 4391));
-app.get("/scores/nhl", async (req,res)=>serveSingle(req,res,"ice_hockey",        4380));
 
-async function serveSingle(req,res,sport,leagueId){
+app.get("/scores/nba", async (req,res)=>serveSingle(req,res,"basketball", L.NBA, seasonsNBA()));
+app.get("/scores/nfl", async (req,res)=>serveSingle(req,res,"american_football", L.NFL, seasonsNFL()));
+app.get("/scores/nhl", async (req,res)=>serveSingle(req,res,"ice_hockey", L.NHL, seasonsNHL()));
+
+async function serveSingle(req,res,sport,leagueId,seasons){
   try{
-    const n=Math.max(5, Math.min(10, parseInt(req.query.n || DEFAULT_COUNT,10) || DEFAULT_COUNT));
-    const items=await getSingleCached(sport, leagueId, n);
+    const n = Math.max(5, Math.min(10, parseInt(req.query.n || DEFAULT_COUNT, 10) || DEFAULT_COUNT));
+    const items = await getBoardCached(`OUT:${sport}:${leagueId}:${n}`, () =>
+      buildLeague({ sport, leagueId, seasons, n })
+    );
     res.json(items.map(formatMatch));
   }catch(e){ console.error(`${sport} error:`,e); res.status(500).json({error:"internal"}); }
 }
