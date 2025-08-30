@@ -1,22 +1,21 @@
-// server.js — v25: robust date-only/TBA parsing; unified single-league builder; no day-scan
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ v25 (robust date-only/TBA; unified builder; no day-scan)";
+const BUILD = "SportsHQ v26 (hardened date parsing for season rows; unified builder; no day-scan)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 if (typeof fetch !== "function") {
   global.fetch = (...args) => import("node-fetch").then(m => m.default(...args));
 }
 
-// ENV
+// ===== ENV =====
 const V2_KEY = process.env.TSDB_V2_KEY || "";
 const V1_KEY = process.env.TSDB_V1_KEY || "";
 if (!V2_KEY) console.warn("ℹ️ TSDB_V2_KEY missing (live may be limited)");
 if (!V1_KEY) console.warn("ℹ️ TSDB_V1_KEY missing; using shared/test key");
 
-// CONFIG
+// ===== CONFIG =====
 const DEFAULT_COUNT = 10;
 const TTL = { LIVE:15_000, NEXT:5*60_000, SEASON:3*60*60_000, PAST:10*60_000, OUT:60_000 };
 const SWR_EXTRA = 5*60_000;
@@ -50,11 +49,10 @@ async function memoJson(url, ttl, extra={}){
   return withInflight(key, fetcher);
 }
 
-// ---------- time / status helpers (hardened) ----------
+// ===== time / status =====
 function pickScore(v){ return (v===undefined||v===null||v===""||v==="N/A")?null:v; }
 function isLiveWord(s=""){ s=(s+"").toLowerCase(); return s.includes("live")||s.includes("in play")||s.includes("half")||s==="ht"||s.includes("ot"); }
 function isFinalWord(s=""){ s=(s+"").toLowerCase(); return s.includes("final")||s==="ft"||s.includes("full time"); }
-
 function normalizeStatus(m,s1,s2){
   const raw=String(m.strStatus||m.strProgress||"").trim(), has=(s1!==null)||(s2!==null);
   if (isFinalWord(raw)) return "Final";
@@ -62,47 +60,85 @@ function normalizeStatus(m,s1,s2){
   if (!raw||raw==="NS"||raw.toLowerCase()==="scheduled"||raw.toLowerCase()==="preview") return "Scheduled";
   return has ? raw : "Scheduled";
 }
+const FINAL_KEEP_MS=15*60*1000;
+function isRecentFinal(m){
+  const raw=m.strStatus||m.strProgress||""; if(!isFinalWord(raw)) return false;
+  const ms=eventMillis(m); if(!Number.isFinite(ms)) return false;
+  return (Date.now()-ms)<=FINAL_KEEP_MS;
+}
 
-const FINAL_KEEP_MS = 15*60*1000;
+// ---------- Hardened timestamp parser ----------
+// Accepts: epoch (sec/ms), ISO, "YYYY-MM-DD HH:MM(:SS) (maybe TZ or not)", date-only, etc.
+function parseFlexibleDate(str){
+  if (str == null) return NaN;
+  if (typeof str !== "string") {
+    // sometimes they send numbers in string-ish fields
+    const n = Number(str);
+    if (Number.isFinite(n)) return n > 1e12 ? n : n*1000; // sec→ms
+    return NaN;
+  }
+  const s = str.trim();
+  if (!s) return NaN;
 
-// New: robust extraction accepting date-only strings
-function eventMillis(m){
-  // 1) explicit epoch fields first
-  if (m.strTimestampMS){ const n=+m.strTimestampMS; if (Number.isFinite(n)) return n; }
-  if (m.strTimestamp){ const n=+m.strTimestamp*1000; if (Number.isFinite(n)) return n; }
+  // epoch-like strings
+  if (/^\d{13}$/.test(s)) return +s;                 // ms
+  if (/^\d{10}$/.test(s)) return +s * 1000;          // sec
 
-  // 2) generic ISO parse with time (works when time provided)
-  const tryIso = (d,t)=>{
-    if(!d) return NaN;
-    const tt = (t && typeof t==="string" && t.trim()) ? t.trim() : "00:00:00";
-    const hasTZ=/[zZ]$|[+\-]\d\d:?\d\d$/.test(tt);
-    const iso = `${d}T${tt}${hasTZ?"":"Z"}`;
+  // ISO or almost-ISO (space instead of T)
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(:\d{2})?/.test(s)) {
+    const withT = s.replace(" ", "T");
+    // if there's no Z/+hh:mm, treat as UTC
+    const hasTZ = /Z$|[+\-]\d\d:?\d\d$/.test(withT);
+    const iso = hasTZ ? withT : (withT + "Z");
     const ms = Date.parse(iso);
-    return Number.isFinite(ms) ? ms : NaN;
-  };
-  let ms = tryIso(m.dateEvent, m.strTime); if (Number.isFinite(ms)) return ms;
-  ms = tryIso(m.dateEventLocal||m.dateEvent, m.strTimeLocal||m.strTime); if (Number.isFinite(ms)) return ms;
+    if (Number.isFinite(ms)) return ms;
+  }
 
-  // 3) NEW: if date-only like YYYY-MM-DD (no time works), anchor at 12:00 UTC to avoid TZ flips
-  const takeDateOnly = d => {
-    if (!d) return NaN;
-    const s = String(d).trim();
-    const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-    if (!m) return NaN;
+  // ISO already (full date-time)
+  const direct = Date.parse(s);
+  if (Number.isFinite(direct)) return direct;
+
+  // date-only "YYYY-MM-DD" → anchor at 12:00 UTC
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) {
     const Y=+m[1], M=+m[2]-1, D=+m[3];
     return Date.UTC(Y, M, D, 12, 0, 0);
-  };
-  ms = takeDateOnly(m.dateEvent); if (Number.isFinite(ms)) return ms;
-  ms = takeDateOnly(m.dateEventLocal); if (Number.isFinite(ms)) return ms;
+  }
 
   return NaN;
 }
+function eventMillis(m){
+  // any explicit timestamp strings first
+  let ms = parseFlexibleDate(m.strTimestampMS); if (Number.isFinite(ms)) return ms;
+  ms = parseFlexibleDate(m.strTimestamp);       if (Number.isFinite(ms)) return ms;
 
-function isRecentFinal(m){
-  const raw=m.strStatus||m.strProgress||"";
-  if (!isFinalWord(raw)) return false;
-  const ms=eventMillis(m); if(!Number.isFinite(ms)) return false;
-  return (Date.now()-ms) <= FINAL_KEEP_MS;
+  // common v1 fields (date+time separated)
+  const candid = [
+    [m.dateEvent,       m.strTime],
+    [m.dateEventLocal,  m.strTimeLocal],
+    [m.dateEvent,       null],
+    [m.dateEventLocal,  null],
+  ];
+  for (const [d,t] of candid){
+    const base = parseFlexibleDate(d);
+    if (Number.isFinite(base)) {
+      if (t && typeof t === "string" && t.trim()) {
+        // recompute with combined dt for better precision
+        const tt = t.trim();
+        const hasTZ=/Z$|[+\-]\d\d:?\d\d$/.test(tt);
+        const composed = `${String(d).trim()}T${tt}${hasTZ?"":"Z"}`;
+        const ms2 = Date.parse(composed);
+        if (Number.isFinite(ms2)) return ms2;
+      }
+      return base; // date-only already anchored at noon UTC
+    }
+  }
+
+  // other odd fields we've seen
+  ms = parseFlexibleDate(m.strDate);            if (Number.isFinite(ms)) return ms;
+  ms = parseFlexibleDate(m.date);               if (Number.isFinite(ms)) return ms;
+
+  return NaN;
 }
 
 function computedStatus(m){
@@ -123,7 +159,7 @@ function sortForDisplay(a,b){
   return ta-tb;
 }
 
-// ---------- TSDB wrappers ----------
+// ===== TSDB wrappers =====
 async function v2Livescore(sport){
   const s=sport.replace(/_/g," ");
   const urls=[`https://www.thesportsdb.com/api/v2/json/livescore/${encodeURIComponent(s)}`,
@@ -136,18 +172,25 @@ async function v1NextLeague(id){ const j=await memoJson(V1(`eventsnextleague.php
 async function v1Season(id,s){ const j=await memoJson(V1(`eventsseason.php?id=${id}&s=${encodeURIComponent(s)}`), TTL.SEASON); return Array.isArray(j?.events)?j.events:[]; }
 async function v1PastLeague(id){ const j=await memoJson(V1(`eventspastleague.php?id=${id}`), TTL.PAST); return Array.isArray(j?.events)?j.events:[]; }
 
-// ---------- seasons ----------
+// ===== seasons =====
 function guessSeasonCrossYear(){ const d=new Date(), y=d.getUTCFullYear(), m=d.getUTCMonth()+1; const start=(m>=7)?y:y-1; return `${start}-${start+1}`; }
 function nextCross(s){ const a=parseInt(s.split("-")[0],10); return `${a+1}-${a+2}`; }
 function prevCross(s){ const a=parseInt(s.split("-")[0],10); return `${a-1}-${a}`; }
-function seasonCandidatesSoccer(){ const c=guessSeasonCrossYear(), y=(new Date()).getUTCFullYear(); return [c, nextCross(c), prevCross(c), String(y), String(y+1), String(y-1)]; }
-function seasonCandidatesNFL(){ const y=(new Date()).getUTCFullYear(), c=guessSeasonCrossYear(); return [String(y), String(y+1), String(y-1), c, nextCross(c), prevCross(c)]; }
+
+function seasonCandidatesSoccer(){
+  const c=guessSeasonCrossYear(), y=(new Date()).getUTCFullYear();
+  return [c, nextCross(c), prevCross(c), String(y), String(y+1), String(y-1)];
+}
+function seasonCandidatesNFL(){
+  const y=(new Date()).getUTCFullYear(), c=guessSeasonCrossYear();
+  return [String(y), String(y+1), String(y-1), c, nextCross(c), prevCross(c)];
+}
 function seasonCandidatesDefault(){ const c=guessSeasonCrossYear(); return [c, nextCross(c), prevCross(c)]; }
 
-// ---------- leagues ----------
+// ===== leagues =====
 const L = { EPL:4328, NBA:4387, NFL:4391, NHL:4380 };
 
-// ---------- format ----------
+// ===== format =====
 function formatMatch(m){
   const home=m.strHomeTeam||m.homeTeam||m.strHome||"", away=m.strAwayTeam||m.awayTeam||m.strAway||"";
   const s1=pickScore(m.intHomeScore??m.intHomeGoals), s2=pickScore(m.intAwayScore??m.intAwayGoals);
@@ -156,7 +199,7 @@ function formatMatch(m){
            headline:`${home} vs ${away} - ${status}`, start:Number.isFinite(ms)?new Date(ms).toISOString():null };
 }
 
-// ---------- unified single-league builder ----------
+// ===== unified single-league builder (no day-scan) =====
 async function buildSingle({ sport, leagueId, n, seasons }){
   const now=Date.now();
   const finals=[], live=[], sched=[];
@@ -183,13 +226,21 @@ async function buildSingle({ sport, leagueId, n, seasons }){
       const rows=await v1Season(leagueId, s);
       const rawCount=(rows||[]).length;
       const fut=(rows||[]).filter(e=>{
-        // Accept future if either:
-        //  - eventMillis is finite and >= now (normal), or
-        //  - date-only string parsed to noon UTC and >= now (handled inside eventMillis)
         const ms=eventMillis(e);
         return Number.isFinite(ms) && ms>=now;
       }).sort((a,b)=>eventMillis(a)-eventMillis(b));
-      console.log(`[debug ${sport}:${leagueId}] season ${s} raw=${rawCount} fut=${fut.length}`);
+
+      // If TSDB returned rows but ALL filtered out, print one compact example of date fields
+      if (rawCount>0 && fut.length===0) {
+        const ex=rows[0]||{};
+        console.warn(`[debug ${sport}:${leagueId}] season ${s} raw=${rawCount} fut=0 exDates=`, {
+          dateEvent:ex.dateEvent, strTime:ex.strTime, dateEventLocal:ex.dateEventLocal, strTimeLocal:ex.strTimeLocal,
+          strTimestamp:ex.strTimestamp, strTimestampMS:ex.strTimestampMS, strDate:ex.strDate
+        });
+      } else {
+        console.log(`[debug ${sport}:${leagueId}] season ${s} raw=${rawCount} fut=${fut.length}`);
+      }
+
       for (const m of fut){ if(finals.length+live.length+sched.length>=n) break; pushUnique(sched,m); }
     }
   }
@@ -202,7 +253,7 @@ async function buildSingle({ sport, leagueId, n, seasons }){
 // cache wrapper
 async function getBoardCached(key, builder){
   const c=getCache(key); if(c.hit && c.fresh) return c.val;
-  const fetcher=async()=>{ const data=await builder(); const full=Array.isArray(data)&&data.length>=(DEFAULT_COUNT||10); setCache(key,data, full?TTL.OUT:8_000); return data; };
+  const fetcher=async()=>{ const data=await builder(); const full=Array.isArray(data)&&data.length>=DEFAULT_COUNT; setCache(key,data, full?TTL.OUT:8_000); return data; };
   if(c.hit && !c.fresh){ withInflight(key, fetcher); return c.val; }
   return withInflight(key, fetcher);
 }
@@ -211,7 +262,7 @@ async function getBoardCached(key, builder){
 app.get("/scores/soccer", async (req,res)=>{
   try{
     const n=Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
-    const items=await getBoardCached(`OUT:soccer_epl_v25:${n}`, () =>
+    const items=await getBoardCached(`OUT:soccer_epl_v26:${n}`, () =>
       buildSingle({ sport:"soccer", leagueId:L.EPL, n, seasons:seasonCandidatesSoccer() })
     );
     console.log(`/scores/soccer -> ${items.length} items (n=${n})`);
@@ -226,7 +277,7 @@ app.get("/scores/nhl", async (req,res)=>serveSingle(req,res,"ice_hockey",       
 async function serveSingle(req,res,sport,leagueId,seasons){
   try{
     const n=Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
-    const items=await getBoardCached(`OUT:${sport}:${leagueId}:v25:${n}`, () =>
+    const items=await getBoardCached(`OUT:${sport}:${leagueId}:v26:${n}`, () =>
       buildSingle({ sport, leagueId, n, seasons })
     );
     console.log(`/scores/${sport} -> ${items.length} items (n=${n})`);
