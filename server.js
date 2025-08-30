@@ -1,11 +1,14 @@
-// server.js — v18: EPL-first (Big-4 fallback) with guaranteed 10 rows,
-// short-TTL for short boards, and reserved day-scan tokens for soccer.
+// server.js — v19: Soccer 10-rows hard guarantee
+// - Precise token use (no big burst) + two-phase day-fill
+// - Final wide fallback if still short
+// - Short TTL for short boards
+// - Logs show where rows came from
 
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ v18 (soccer 10-rows guaranteed; short-TTL; token reserve)";
+const BUILD = "SportsHQ v19 (soccer 10 rows: precise tokens + two-phase fill + wide fallback)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 // Polyfill fetch for Node < 18
@@ -14,34 +17,32 @@ if (typeof fetch !== "function") {
 }
 
 // ===== ENV KEYS =====
-const V2_KEY = process.env.TSDB_V2_KEY || ""; // v2 livescore header
-const V1_KEY = process.env.TSDB_V1_KEY || ""; // v1 path key (falls back to "3")
+const V2_KEY = process.env.TSDB_V2_KEY || "";
+const V1_KEY = process.env.TSDB_V1_KEY || "";
 if (!V2_KEY) console.warn("ℹ️ TSDB_V2_KEY missing (live may be limited)");
 if (!V1_KEY) console.warn("ℹ️ TSDB_V1_KEY missing; using shared/test key");
 
 // ===== CONFIG =====
-const DEFAULT_COUNT = 10;        // rows per board (client asks for 10)
-const SOCCER_RELAX_FILL = true;  // if EPL < 10, top up with other Big-4
+const DEFAULT_COUNT = 10;        // rows per board
+const SOCCER_RELAX_FILL = true;  // EPL first, then Big-4 to top up
 
 // Caches
 const TTL = {
-  LIVE:   15_000,          // live score feed
-  NEXT:   5 * 60_000,      // next-league
-  SEASON: 6 * 60 * 60_000, // season pages
-  DAY:    30 * 60_000,     // day queries
-  PAST:   10 * 60_000,     // recent past
-  OUT:    60_000,          // final aggregated board
+  LIVE:   15_000,
+  NEXT:   5 * 60_000,
+  SEASON: 6 * 60 * 60_000,
+  DAY:    30 * 60_000,
+  PAST:   10 * 60_000,
+  OUT:    60_000,
 };
-const SWR_EXTRA = 5 * 60_000;    // serve stale while revalidating
+const SWR_EXTRA = 5 * 60_000;
 
-// Day-scan token bucket (limits v1 calls under 429 pressure)
-const DAY_TOKENS_MAX   = 80;
-const DAY_TOKENS_BURST = 20;
+// Token bucket for day scans (to stay under v1 429s)
+const DAY_TOKENS_MAX = 80;
 const DAY_TOKENS_REFILL_MS = 10_000;
 let DAY_TOKENS = DAY_TOKENS_MAX;
-// Reserve a tiny floor specifically so SOCCER can always top up.
+// Reserve a tiny floor for soccer so it can always top-up
 const SOCCER_MIN_TOKENS = 6;
-
 setInterval(() => { DAY_TOKENS = Math.min(DAY_TOKENS_MAX, DAY_TOKENS + 4); }, DAY_TOKENS_REFILL_MS);
 
 const COMMON_HEADERS = { "User-Agent":"SportsHQ/1.0 (+render.com)", "Accept":"application/json" };
@@ -50,7 +51,7 @@ const jitter = ms => ms + Math.floor(Math.random() * (ms/3));
 
 // ===== SWR cache + in-flight dedupe =====
 const cache = new Map();    // key -> {val,exp,swr}
-const inflight = new Map(); // key -> Promise
+const inflight = new Map();
 
 function getCache(key){
   const e = cache.get(key);
@@ -152,8 +153,8 @@ function sortForDisplay(a,b){
   const aBad=!isFinite(ta), bBad=!isFinite(tb);
   if (aBad && !bBad) return +1;
   if (!aBad && bBad) return -1;
-  if (sa==="Final") return tb-ta; // newest finals first
-  return ta-tb;                   // soonest first
+  if (sa==="Final") return tb-ta; // newest finals
+  return ta-tb;                   // soonest
 }
 
 // ===== TSDB wrappers =====
@@ -229,21 +230,50 @@ async function fillFromSeasons(out, leagueId, seasons, n){
   }
 }
 
-// day-scan across a set of soccer leagues with token reserve
+// generic day-fill for one league (uses shared tokens)
+async function dayFillLeague(sport, leagueId, out, n, budget){
+  const need = n - out.length;
+  if (need <= 0 || budget <= 0) return 0;
+  const today=new Date(); let used=0;
+  const now=Date.now();
+
+  outer: for (let d=0; d<56; d++){      // up to 8 weeks if needed
+    if (used >= budget) break;
+    const ymd=new Date(today.getTime()+d*86400000).toISOString().slice(0,10);
+    const rows=await v1EventsDay(sport, ymd); used++;
+    const fut=(rows||[])
+      .filter(m => String(m.idLeague||"")===String(leagueId))
+      .filter(m => { const ms=eventMillis(m); return isFinite(ms) && ms>=now; })
+      .sort((a,b)=>eventMillis(a)-eventMillis(b));
+    for (const m of fut){
+      if (out.length>=n) break outer;
+      pushUnique(out, m);
+    }
+  }
+  return used;
+}
+
+// day-fill across a set of soccer leagues with a reserved token pool
 async function dayFillSoccer(leagues, out, n){
   const need = n - out.length;
-  if (need <= 0) return;
+  if (need <= 0) return {used:0, phase:"none"};
 
-  const want  = Math.max(2, need * 2); // proportional to need
+  // Spend tokens proportional to need, with a small floor.
+  const want  = Math.max(need * 3, 6); // e.g. need=4 -> want=12
   const avail = Math.max(SOCCER_MIN_TOKENS, DAY_TOKENS);
-  const use   = Math.min(avail, Math.max(DAY_TOKENS_BURST, want));
+  const use   = Math.min(avail, want);
 
-  if (use <= 0) { console.warn("[DAY throttle] soccer short, no tokens"); return; }
-  DAY_TOKENS -= Math.max(0, use - SOCCER_MIN_TOKENS);
+  if (use <= 0) { console.warn("[DAY throttle] soccer short, no tokens"); return {used:0, phase:"throttle"}; }
+  // Don't consume the reserved floor from DAY_TOKENS
+  const consume = Math.max(0, use - SOCCER_MIN_TOKENS);
+  DAY_TOKENS -= consume;
 
+  let used = 0;
+
+  // Phase A: pooled scan across days for ALL chosen leagues together (cheap uniqueness)
   const now=Date.now();
-  const today=new Date(); let used=0;
-  outer: for (let d=0; d<28; d++){ // up to 4 weeks
+  const today=new Date();
+  outerA: for (let d=0; d<28; d++){
     if (used >= use) break;
     const ymd=new Date(today.getTime()+d*86400000).toISOString().slice(0,10);
     const rows=await v1EventsDay("soccer", ymd); used++;
@@ -252,10 +282,21 @@ async function dayFillSoccer(leagues, out, n){
       .filter(m => { const ms=eventMillis(m); return isFinite(ms) && ms>=now; })
       .sort((a,b)=>eventMillis(a)-eventMillis(b));
     for (const m of fut){
-      if (out.length>=n) break outer;
+      if (out.length>=n) break outerA;
       pushUnique(out, m);
     }
   }
+  if (out.length >= n) return {used, phase:"A"};
+
+  // Phase B: targeted per-league top-up with the remaining budget
+  let remaining = Math.max(0, use - used);
+  for (const lg of leagues){
+    if (out.length >= n || remaining <= 0) break;
+    const spend = Math.max(2, Math.ceil(remaining / (leagues.length))); // spread fairly
+    const did = await dayFillLeague("soccer", lg, out, n, spend);
+    used += did; remaining = Math.max(0, use - used);
+  }
+  return {used, phase:(out.length>=n?"B":"B_short")};
 }
 
 // ===== core builders =====
@@ -263,7 +304,7 @@ async function buildSoccerGuaranteed(n){
   const finals=[], live=[], sched=[];
   const now = Date.now();
 
-  // 1) recent finals (EPL only)
+  // 1) recent finals (EPL)
   const past = await v1PastLeague(L.EPL);
   for (const m of (past||[])) if (isRecentFinal(m)) pushUnique(finals, m);
   finals.sort((a,b)=>eventMillis(b)-eventMillis(a));
@@ -275,7 +316,7 @@ async function buildSoccerGuaranteed(n){
   // 3) EPL seasons first (future)
   await fillFromSeasons(sched, L.EPL, seasonsCrossTriple(), n - (finals.length+live.length));
 
-  // 4) cheap NEXT top-up (EPL then other Big-4 if relax)
+  // 4) NEXT top-up: EPL then other Big-4 (cheap)
   const nextLists = [];
   nextLists.push(await v1NextLeague(L.EPL));
   if (SOCCER_RELAX_FILL) for (const lg of SOCCER_BIG4) if (lg!==L.EPL) nextLists.push(await v1NextLeague(lg));
@@ -289,7 +330,7 @@ async function buildSoccerGuaranteed(n){
     if (finals.length+live.length+sched.length >= n) break;
   }
 
-  // 5) other Big-4 seasons (only if still short and relax on)
+  // 5) other Big-4 seasons if still short
   if (SOCCER_RELAX_FILL && (finals.length+live.length+sched.length) < n){
     for (const lg of SOCCER_BIG4){
       if (lg === L.EPL) continue;
@@ -298,12 +339,35 @@ async function buildSoccerGuaranteed(n){
     }
   }
 
-  // 6) day-scan fallback with token reserve
+  // 6) day-scan with token reserve (two-phase)
+  let phaseInfo = {used:0, phase:"skip"};
   if ((finals.length+live.length+sched.length) < n){
-    await dayFillSoccer(SOCCER_RELAX_FILL ? SOCCER_BIG4 : [L.EPL], sched, n - (finals.length+live.length));
+    phaseInfo = await dayFillSoccer(SOCCER_RELAX_FILL ? SOCCER_BIG4 : [L.EPL], sched, n - (finals.length+live.length));
+  }
+
+  // 7) last-chance wide fallback (very light): peek a few extra days if still short
+  if ((finals.length+live.length+sched.length) < n){
+    const short = n - (finals.length+live.length+sched.length);
+    const bonusDays = Math.min(6, short * 3);  // small, proportional
+    const today=new Date();
+    const now2 = Date.now();
+    for (let d=28; d<28+bonusDays; d++){
+      const ymd=new Date(today.getTime()+d*86400000).toISOString().slice(0,10);
+      const rows=await v1EventsDay("soccer", ymd);
+      const fut=(rows||[])
+        .filter(m => SOCCER_BIG4.includes(Number(m.idLeague||0)))
+        .filter(m => { const ms=eventMillis(m); return isFinite(ms) && ms>=now2; })
+        .sort((a,b)=>eventMillis(a)-eventMillis(b));
+      for (const m of fut){
+        if (finals.length+live.length+sched.length >= n) break;
+        pushUnique(sched, m);
+      }
+      if (finals.length+live.length+sched.length >= n) break;
+    }
   }
 
   const merged = [...finals, ...live, ...sched].sort(sortForDisplay).slice(0, n);
+  console.log(`[soccer] finals=${finals.length} live=${live.length} sched=${sched.length} -> out=${merged.length}  (day phase=${phaseInfo.phase}, used=${phaseInfo.used})`);
   return merged;
 }
 
@@ -320,7 +384,7 @@ async function buildSingle({ sport, leagueId, seasons, n }){
 
   await fillFromSeasons(sched, leagueId, seasons, n - (finals.length+live.length));
 
-  // cheap NEXT before day scans
+  // cheap NEXT before any day scan
   if ((finals.length+live.length+sched.length) < n){
     const next=(await v1NextLeague(leagueId)).sort((a,b)=>eventMillis(a)-eventMillis(b));
     for (const m of next){
@@ -330,30 +394,22 @@ async function buildSingle({ sport, leagueId, seasons, n }){
     }
   }
 
-  // light per-league day scan sharing the bucket
-  let shortBy = n - (finals.length+live.length+sched.length);
-  if (shortBy > 0){
-    const want = Math.max(2, shortBy * 2);
-    const use  = Math.min(DAY_TOKENS, Math.max(DAY_TOKENS_BURST, want));
+  // day scan (shared tokens), precise spend
+  const need = n - (finals.length+live.length+sched.length);
+  if (need > 0){
+    const want = Math.max(need * 3, 6);
+    const use  = Math.min(DAY_TOKENS, want);
     if (use > 0){
       DAY_TOKENS -= use;
-      const today=new Date(); let used=0;
-      outer: for (let d=0; d<28; d++){
-        if (used >= use) break;
-        const ymd=new Date(today.getTime()+d*86400000).toISOString().slice(0,10);
-        const rows=await v1EventsDay(sport, ymd); used++;
-        const fut=(rows||[])
-          .filter(m => String(m.idLeague||"")===String(leagueId))
-          .filter(m => { const ms=eventMillis(m); return isFinite(ms) && ms>=now; })
-          .sort((a,b)=>eventMillis(a)-eventMillis(b));
-        for (const m of fut){ if (finals.length+live.length+sched.length >= n) break outer; pushUnique(sched, m); }
-      }
+      await dayFillLeague(sport, leagueId, sched, n, use);
     } else {
       console.warn(`[DAY throttle] still short for ${sport} ${leagueId}`);
     }
   }
 
-  return [...finals, ...live, ...sched].sort(sortForDisplay).slice(0, n);
+  const merged = [...finals, ...live, ...sched].sort(sortForDisplay).slice(0, n);
+  console.log(`[${sport}] out=${merged.length} (finals=${finals.length}, live=${live.length}, sched=${sched.length})`);
+  return merged;
 }
 
 // ===== cached wrappers (short-TTL for short results) =====
@@ -371,6 +427,10 @@ async function getBoardCached(key, builder){
   if (c.hit && !c.fresh){ withInflight(key, fetcher); return c.val; }
   return withInflight(key, fetcher);
 }
+
+// ===== seasons helpers =====
+function seasonsCrossTriple(){ const c=guessSeasonCrossYear(); return [c, nextCross(c), prevCross(c)]; }
+function seasonsNFL(){ const y=(new Date()).getUTCFullYear(); const c=guessSeasonCrossYear(); return [String(y), String(y+1), c, prevCross(c)]; }
 
 // ===== routes =====
 app.get("/scores/soccer", async (req,res)=>{
