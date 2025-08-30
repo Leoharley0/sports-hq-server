@@ -1,9 +1,11 @@
-// server.js — v12: low-stress (10 rows), EPL-only soccer, SWR cache + 429 backoff
+// server.js — v13: 10 rows, EPL-only soccer, 429-resilient SWR cache,
+// season fallback for NFL/NBA/NHL, gentle day-scan throttle.
+
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ v12 (10 rows + EPL-only)";
+const BUILD = "SportsHQ v13 (10 rows + EPL-only + season fallback singles)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 // Polyfill fetch for Node < 18
@@ -12,8 +14,8 @@ if (typeof fetch !== "function") {
 }
 
 // ===== ENV KEYS =====
-const V2_KEY = process.env.TSDB_V2_KEY || "";
-const V1_KEY = process.env.TSDB_V1_KEY || ""; // if blank we fall back to the shared test key
+const V2_KEY = process.env.TSDB_V2_KEY || ""; // v2 livescore header (optional)
+const V1_KEY = process.env.TSDB_V1_KEY || ""; // v1 path key (if blank, we fall back to shared test key "3")
 if (!V2_KEY) console.warn("ℹ️ TSDB_V2_KEY missing; live coverage may be limited");
 if (!V1_KEY) console.warn("ℹ️ TSDB_V1_KEY missing; using shared/test key behaviour");
 
@@ -169,8 +171,36 @@ async function v1EventsDay(sport, ymd){
 }
 
 // ===== seasons =====
-function guessSeasonCrossYear(){ const d=new Date(), y=d.getUTCFullYear(), m=d.getUTCMonth()+1, s=(m>=7)?y:y-1; return `${s}-${s+1}`; }
-function seasonCandidatesEPL(){ const cross=guessSeasonCrossYear(); const prev = cross.split("-")[0]-1; return [cross, `${prev}-${prev+1}`]; }
+function guessSeasonCrossYear(){
+  const d=new Date(), y=d.getUTCFullYear(), m=d.getUTCMonth()+1;
+  const start = (m>=7)? y : y-1;
+  return `${start}-${start+1}`;
+}
+function seasonCandidatesEPL(){
+  const cross=guessSeasonCrossYear();
+  const prevStart = parseInt(cross.split("-")[0],10)-1;
+  return [cross, `${prevStart}-${prevStart+1}`];
+}
+function seasonCandidatesSingle(sport, leagueId){
+  const d=new Date(), y=d.getUTCFullYear();
+  const cross = guessSeasonCrossYear();
+  const crossStart = parseInt(cross.split("-")[0],10);
+  const crossPrev = `${crossStart-1}-${crossStart}`;
+
+  if (sport==="american_football" || leagueId===4391) {
+    // NFL mostly single-year labels
+    return [String(y), String(y-1), cross, crossPrev];
+  }
+  if (sport==="basketball" || leagueId===4387) {
+    // NBA cross-year
+    return [cross, crossPrev, String(y)];
+  }
+  if (sport==="ice_hockey" || leagueId===4380) {
+    // NHL cross-year
+    return [cross, crossPrev, String(y)];
+  }
+  return [cross, String(y)];
+}
 
 // ===== format out =====
 function formatMatch(m){
@@ -209,10 +239,9 @@ async function buildSoccerEPL(n){
     for (const m of next){ if (out.length>=n) break; pushUnique(out,m); }
   }
 
-  // If still short, hit current-season once
+  // If still short, hit current/prev season
   if (out.length < n){
-    const seasons = seasonCandidatesEPL();
-    for (const s of seasons){
+    for (const s of seasonCandidatesEPL()){
       const sea = (await v1Season(EPL, s))
         .filter(m => { const ms=eventMillis(m); return isFinite(ms) && ms>=Date.now(); })
         .sort((a,b)=>eventMillis(a)-eventMillis(b));
@@ -221,7 +250,7 @@ async function buildSoccerEPL(n){
     }
   }
 
-  // Gentle day fill (2 weeks max, token-limited)
+  // Gentle day fill (≤ 2 weeks, token-limited)
   if (out.length < n){
     const today=new Date();
     outer: for (let w=0; w<2; w++){
@@ -235,7 +264,7 @@ async function buildSoccerEPL(n){
     }
   }
 
-  // Fresh recent finals to fill remaining slots
+  // Recent finals to fill remaining slots
   if (out.length < n){
     const past = (await v1PastLeague(EPL)).sort((a,b)=>eventMillis(b)-eventMillis(a));
     for (const m of past){
@@ -257,34 +286,60 @@ function leagueMatch(m, leagueId, sport){
   if (sport==="ice_hockey")        return idOk || name.includes("nhl");
   return idOk;
 }
+
+// Enhanced single-league builder (adds season fallback + deeper NFL day window)
 async function buildSingle(sport, leagueId, n){
   const out=[];
+
+  // LIVE
   const live=await v2Livescore(sport);
   for (const m of live||[]) if (leagueMatch(m,leagueId,sport) && !isOldFinal(m)) pushUnique(out,m);
 
+  // NEXT
   if (out.length<n){
     const e=(await v1NextLeague(leagueId)).sort((a,b)=>eventMillis(a)-eventMillis(b));
     for (const m of e){ if (out.length>=n) break; if (leagueMatch(m,leagueId,sport)) pushUnique(out,m); }
   }
 
-  // very light day fill (≤ 1 week)
+  // SEASON fallback (future fixtures from current/prev)
+  if (out.length<n){
+    for (const s of seasonCandidatesSingle(sport, leagueId)){
+      const rows = await v1Season(leagueId, s);
+      const fut = (rows||[])
+        .filter(m => leagueMatch(m,leagueId,sport) && isFinite(eventMillis(m)) && eventMillis(m)>=Date.now())
+        .sort((a,b)=>eventMillis(a)-eventMillis(b));
+      for (const m of fut){ if (out.length>=n) break; pushUnique(out,m); }
+      if (out.length>=n) break;
+    }
+  }
+
+  // Day-fill window (wider for NFL; modest for NBA/NHL)
   if (out.length<n){
     const today=new Date();
-    outer: for (let d=0; d<7; d++){
-      const ymd=new Date(today.getTime()+d*86400000).toISOString().slice(0,10);
-      const rows=await v1EventsDay(sport, ymd);
-      for (const m of rows||[]){
-        if (out.length>=n) break outer;
-        if (!leagueMatch(m,leagueId,sport)) continue;
-        const ms=eventMillis(m); if (isFinite(ms) && ms<Date.now()) continue;
-        pushUnique(out,m);
+    const weeks = (sport==="american_football") ? 6 : 3; // NFL wider window
+    outer: for (let w=0; w<weeks; w++){
+      for (let d=0; d<7; d++){
+        const ymd=new Date(today.getTime()+(w*7+d)*86400000).toISOString().slice(0,10);
+        const rows=await v1EventsDay(sport, ymd);
+        for (const m of rows||[]){
+          if (out.length>=n) break outer;
+          if (!leagueMatch(m,leagueId,sport)) continue;
+          const ms=eventMillis(m); if (isFinite(ms) && ms<Date.now()) continue;
+          pushUnique(out,m);
+        }
       }
     }
   }
 
+  // Recent finals if still short
   if (out.length<n){
     const p=(await v1PastLeague(leagueId)).sort((a,b)=>eventMillis(b)-eventMillis(a));
-    for (const m of p){ if (out.length>=n) break; if (!leagueMatch(m,leagueId,sport)) continue; m.strStatus=m.strStatus||"Final"; if (!isOldFinal(m)) pushUnique(out,m); }
+    for (const m of p){
+      if (out.length>=n) break;
+      if (!leagueMatch(m,leagueId,sport)) continue;
+      m.strStatus=m.strStatus||"Final";
+      if (!isOldFinal(m)) pushUnique(out,m);
+    }
   }
 
   out.sort(sortForDisplay);
@@ -309,7 +364,23 @@ async function getSingleCached(sport, leagueId, n){
   return withInflight(key, fetcher);
 }
 
-// ===== routes =====
+// ===== output routes =====
+function formatMatch(m){
+  const home=m.strHomeTeam||m.homeTeam||m.strHome||"";
+  const away=m.strAwayTeam||m.awayTeam||m.strAway||"";
+  const s1=pickScore(m.intHomeScore??m.intHomeGoals);
+  const s2=pickScore(m.intAwayScore??m.intAwayGoals);
+  const status=normalizeStatus(m,s1,s2);
+  const ms=eventMillis(m);
+  return {
+    team1:home, team2:away,
+    score1:s1===null?"N/A":String(s1),
+    score2:s2===null?"N/A":String(s2),
+    headline:`${home} vs ${away} - ${status}`,
+    start:isFinite(ms)?new Date(ms).toISOString():null
+  };
+}
+
 app.get("/scores/soccer", async (req,res)=>{
   try{
     const n = Math.max(5, Math.min(10, parseInt(req.query.n || DEFAULT_COUNT, 10) || DEFAULT_COUNT));
