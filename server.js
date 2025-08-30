@@ -1,11 +1,11 @@
-// server.js — v17: Soccer EPL-first with Big-4 fallback to guarantee 10 rows,
-// order = Finals (≤15m) → Live → Scheduled (soonest), low-load SWR design.
+// server.js — v18: EPL-first (Big-4 fallback) with guaranteed 10 rows,
+// short-TTL for short boards, and reserved day-scan tokens for soccer.
 
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ v17 (soccer EPL-first + Big4 fallback, 10 rows guaranteed)";
+const BUILD = "SportsHQ v18 (soccer 10-rows guaranteed; short-TTL; token reserve)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 // Polyfill fetch for Node < 18
@@ -15,29 +15,33 @@ if (typeof fetch !== "function") {
 
 // ===== ENV KEYS =====
 const V2_KEY = process.env.TSDB_V2_KEY || ""; // v2 livescore header
-const V1_KEY = process.env.TSDB_V1_KEY || ""; // v1 path key (falls back to public "3")
+const V1_KEY = process.env.TSDB_V1_KEY || ""; // v1 path key (falls back to "3")
 if (!V2_KEY) console.warn("ℹ️ TSDB_V2_KEY missing (live may be limited)");
 if (!V1_KEY) console.warn("ℹ️ TSDB_V1_KEY missing; using shared/test key");
 
 // ===== CONFIG =====
-const DEFAULT_COUNT = 10;               // rows per board
-const SOCCER_RELAX_FILL = true;         // if EPL < 10, fill with other Big-4 leagues
+const DEFAULT_COUNT = 10;        // rows per board (client asks for 10)
+const SOCCER_RELAX_FILL = true;  // if EPL < 10, top up with other Big-4
 
+// Caches
 const TTL = {
-  LIVE:   15_000,
-  NEXT:   5 * 60_000,
-  SEASON: 6 * 60 * 60_000,
-  DAY:    30 * 60_000,
-  PAST:   10 * 60_000,
-  OUT:    60_000,
+  LIVE:   15_000,          // live score feed
+  NEXT:   5 * 60_000,      // next-league
+  SEASON: 6 * 60 * 60_000, // season pages
+  DAY:    30 * 60_000,     // day queries
+  PAST:   10 * 60_000,     // recent past
+  OUT:    60_000,          // final aggregated board
 };
-const SWR_EXTRA = 5 * 60_000;
+const SWR_EXTRA = 5 * 60_000;    // serve stale while revalidating
 
-// Day-scan throttle (bursty enough to fill on cold start; cached results make it cheap later)
+// Day-scan token bucket (limits v1 calls under 429 pressure)
 const DAY_TOKENS_MAX   = 80;
 const DAY_TOKENS_BURST = 20;
 const DAY_TOKENS_REFILL_MS = 10_000;
 let DAY_TOKENS = DAY_TOKENS_MAX;
+// Reserve a tiny floor specifically so SOCCER can always top up.
+const SOCCER_MIN_TOKENS = 6;
+
 setInterval(() => { DAY_TOKENS = Math.min(DAY_TOKENS_MAX, DAY_TOKENS + 4); }, DAY_TOKENS_REFILL_MS);
 
 const COMMON_HEADERS = { "User-Agent":"SportsHQ/1.0 (+render.com)", "Accept":"application/json" };
@@ -66,7 +70,7 @@ async function withInflight(key, fn){
   inflight.set(key,p); return p;
 }
 
-// ===== robust fetch =====
+// ===== robust fetch with 429 backoff =====
 async function fetchJsonRetry(url, extra={}, tries=4, baseDelay=650){
   let lastErr;
   for (let i=0;i<tries;i++){
@@ -96,7 +100,7 @@ async function memoJson(url, ttl, extra={}){
   const c = getCache(key);
   if (c.hit && c.fresh) return c.val;
 
-  const fetcher = async ()=>{
+  const fetcher = async ()=> {
     const j = await fetchJsonRetry(url, extra);
     if (j) setCache(key, j, ttl);
     return j || c.val || null;
@@ -148,8 +152,8 @@ function sortForDisplay(a,b){
   const aBad=!isFinite(ta), bBad=!isFinite(tb);
   if (aBad && !bBad) return +1;
   if (!aBad && bBad) return -1;
-  if (sa==="Final") return tb-ta; // newest finals
-  return ta-tb;                   // soonest
+  if (sa==="Final") return tb-ta; // newest finals first
+  return ta-tb;                   // soonest first
 }
 
 // ===== TSDB wrappers =====
@@ -204,8 +208,13 @@ function formatMatch(m){
   const s2=pickScore(m.intAwayScore??m.intAwayGoals);
   const status=normalizeStatus(m,s1,s2);
   const ms=eventMillis(m);
-  return { team1:home, team2:away, score1:s1===null?"N/A":String(s1), score2:s2===null?"N/A":String(s2),
-           headline:`${home} vs ${away} - ${status}`, start:isFinite(ms)?new Date(ms).toISOString():null };
+  return {
+    team1:home, team2:away,
+    score1:s1===null?"N/A":String(s1),
+    score2:s2===null?"N/A":String(s2),
+    headline:`${home} vs ${away} - ${status}`,
+    start:isFinite(ms)?new Date(ms).toISOString():null
+  };
 }
 
 // ===== helpers =====
@@ -219,12 +228,18 @@ async function fillFromSeasons(out, leagueId, seasons, n){
     if (out.length>=n) break;
   }
 }
+
+// day-scan across a set of soccer leagues with token reserve
 async function dayFillSoccer(leagues, out, n){
-  let shortBy = n - out.length;
-  if (shortBy <= 0) return;
-  const use = Math.min(DAY_TOKENS, Math.max(DAY_TOKENS_BURST, shortBy * 2));
+  const need = n - out.length;
+  if (need <= 0) return;
+
+  const want  = Math.max(2, need * 2); // proportional to need
+  const avail = Math.max(SOCCER_MIN_TOKENS, DAY_TOKENS);
+  const use   = Math.min(avail, Math.max(DAY_TOKENS_BURST, want));
+
   if (use <= 0) { console.warn("[DAY throttle] soccer short, no tokens"); return; }
-  DAY_TOKENS -= use;
+  DAY_TOKENS -= Math.max(0, use - SOCCER_MIN_TOKENS);
 
   const now=Date.now();
   const today=new Date(); let used=0;
@@ -253,14 +268,28 @@ async function buildSoccerGuaranteed(n){
   for (const m of (past||[])) if (isRecentFinal(m)) pushUnique(finals, m);
   finals.sort((a,b)=>eventMillis(b)-eventMillis(a));
 
-  // 2) live (all soccer, but prefer EPL first when sorting later)
+  // 2) live (Big-4 only)
   const ls = await v2Livescore("soccer");
   for (const m of (ls||[])) if (!isRecentFinal(m) && SOCCER_BIG4.includes(Number(m.idLeague||0))) pushUnique(live, m);
 
-  // 3) scheduled — EPL seasons first
+  // 3) EPL seasons first (future)
   await fillFromSeasons(sched, L.EPL, seasonsCrossTriple(), n - (finals.length+live.length));
 
-  // 4) if still short and allowed, pull from other Big-4 leagues
+  // 4) cheap NEXT top-up (EPL then other Big-4 if relax)
+  const nextLists = [];
+  nextLists.push(await v1NextLeague(L.EPL));
+  if (SOCCER_RELAX_FILL) for (const lg of SOCCER_BIG4) if (lg!==L.EPL) nextLists.push(await v1NextLeague(lg));
+  for (const list of nextLists){
+    const next=(list||[]).sort((a,b)=>eventMillis(a)-eventMillis(b));
+    for (const m of next){
+      if (finals.length+live.length+sched.length >= n) break;
+      const ms=eventMillis(m); if (!isFinite(ms)||ms<now) continue;
+      pushUnique(sched, m);
+    }
+    if (finals.length+live.length+sched.length >= n) break;
+  }
+
+  // 5) other Big-4 seasons (only if still short and relax on)
   if (SOCCER_RELAX_FILL && (finals.length+live.length+sched.length) < n){
     for (const lg of SOCCER_BIG4){
       if (lg === L.EPL) continue;
@@ -269,20 +298,7 @@ async function buildSoccerGuaranteed(n){
     }
   }
 
-  // 5) next-league (cheap) for any league still needed to top up
-  if ((finals.length+live.length+sched.length) < n){
-    for (const lg of (SOCCER_RELAX_FILL ? SOCCER_BIG4 : [L.EPL])){
-      const next=(await v1NextLeague(lg)).sort((a,b)=>eventMillis(a)-eventMillis(b));
-      for (const m of next){
-        if (finals.length+live.length+sched.length >= n) break;
-        const ms=eventMillis(m); if (!isFinite(ms)||ms<now) continue;
-        pushUnique(sched, m);
-      }
-      if (finals.length+live.length+sched.length >= n) break;
-    }
-  }
-
-  // 6) day-scan fallback (tokened) across Big-4 (or just EPL)
+  // 6) day-scan fallback with token reserve
   if ((finals.length+live.length+sched.length) < n){
     await dayFillSoccer(SOCCER_RELAX_FILL ? SOCCER_BIG4 : [L.EPL], sched, n - (finals.length+live.length));
   }
@@ -304,6 +320,7 @@ async function buildSingle({ sport, leagueId, seasons, n }){
 
   await fillFromSeasons(sched, leagueId, seasons, n - (finals.length+live.length));
 
+  // cheap NEXT before day scans
   if ((finals.length+live.length+sched.length) < n){
     const next=(await v1NextLeague(leagueId)).sort((a,b)=>eventMillis(a)-eventMillis(b));
     for (const m of next){
@@ -313,10 +330,11 @@ async function buildSingle({ sport, leagueId, seasons, n }){
     }
   }
 
-  // light day-scan per single league (re-uses global token pool)
+  // light per-league day scan sharing the bucket
   let shortBy = n - (finals.length+live.length+sched.length);
   if (shortBy > 0){
-    const use = Math.min(DAY_TOKENS, Math.max(DAY_TOKENS_BURST, shortBy * 2));
+    const want = Math.max(2, shortBy * 2);
+    const use  = Math.min(DAY_TOKENS, Math.max(DAY_TOKENS_BURST, want));
     if (use > 0){
       DAY_TOKENS -= use;
       const today=new Date(); let used=0;
@@ -338,11 +356,18 @@ async function buildSingle({ sport, leagueId, seasons, n }){
   return [...finals, ...live, ...sched].sort(sortForDisplay).slice(0, n);
 }
 
-// ===== cached wrappers =====
+// ===== cached wrappers (short-TTL for short results) =====
 async function getBoardCached(key, builder){
   const c=getCache(key);
   if (c.hit && c.fresh) return c.val;
-  const fetcher=async()=>{ const data=await builder(); setCache(key,data,TTL.OUT); return data; };
+
+  const fetcher=async()=>{
+    const data=await builder();
+    const full = Array.isArray(data) && data.length >= (DEFAULT_COUNT || 10);
+    setCache(key, data, full ? TTL.OUT : 10_000); // short cache if short list
+    return data;
+  };
+
   if (c.hit && !c.fresh){ withInflight(key, fetcher); return c.val; }
   return withInflight(key, fetcher);
 }
@@ -354,6 +379,7 @@ app.get("/scores/soccer", async (req,res)=>{
     const items = await getBoardCached(`OUT:soccer_big4:${n}:${SOCCER_RELAX_FILL?1:0}`, () =>
       buildSoccerGuaranteed(n)
     );
+    console.log(`/scores/soccer -> ${items.length} items (n=${n})`);
     res.json(items.map(formatMatch));
   }catch(e){ console.error("soccer error:", e); res.status(500).json({error:"internal"}); }
 });
@@ -368,6 +394,7 @@ async function serveSingle(req,res,sport,leagueId,seasons){
     const items = await getBoardCached(`OUT:${sport}:${leagueId}:${n}`, () =>
       buildSingle({ sport, leagueId, seasons, n })
     );
+    console.log(`/scores/${sport} -> ${items.length} items (n=${n})`);
     res.json(items.map(formatMatch));
   }catch(e){ console.error(`${sport} error:`, e); res.status(500).json({error:"internal"}); }
 }
