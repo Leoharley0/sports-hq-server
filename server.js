@@ -23,7 +23,7 @@ if (!V1_KEY) console.warn("ℹ️ TSDB_V1_KEY missing; using shared/test key");
 // CONFIG
 const DEFAULT_COUNT = 10;
 const SOCCER_RELAX_FILL = true;     // Big-4 fallback
-const SOCCER_LAST_RESORT_ANY = true; // if still short, accept ANY soccer to reach n (set false to disable)
+const SOCCER_LAST_RESORT_ANY = false; // if still short, accept ANY soccer to reach n (set false to disable)
 
 // Cache TTLs
 const TTL = {
