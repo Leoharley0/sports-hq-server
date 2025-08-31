@@ -1,10 +1,10 @@
-// server.js — v28: final fix for date-only/TBA NFL/EPL rows (+rescue), low-load SWR, aliases kept.
+// server.js — v29: robust date parser + throttled day-fill fallback for EPL/NFL when season/next return too few
 
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ v28 (robust date parser + season rescue + aliases)";
+const BUILD = "SportsHQ v29 (robust time + day-fill fallback, aliases)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 if (typeof fetch !== "function") {
@@ -19,7 +19,7 @@ if (!V1_KEY) console.warn("ℹ️ TSDB_V1_KEY missing; using shared/test key");
 
 // ===== CONFIG / CACHE =====
 const DEFAULT_COUNT = 10;
-const TTL = { LIVE:15_000, NEXT:5*60_000, SEASON:3*60*60_000, PAST:10*60_000, OUT:60_000 };
+const TTL = { LIVE:15_000, NEXT:5*60_000, SEASON:3*60*60_000, PAST:10*60_000, DAY:30*60_000, OUT:60_000 };
 const SWR_EXTRA = 5*60_000;
 
 const cache = new Map(), inflight = new Map();
@@ -30,8 +30,7 @@ function getCache(k){ const e=cache.get(k); if(!e) return {hit:false}; const now
 }
 function setCache(k,val,ttl){ const now=Date.now(); cache.set(k,{val,exp:now+ttl,swr:now+ttl+SWR_EXTRA}); }
 async function withInflight(k,fn){ if(inflight.has(k)) return inflight.get(k);
-  const p=(async()=>{ try{ return await fn(); } finally{ inflight.delete(k); } })();
-  inflight.set(k,p); return p;
+  const p=(async()=>{ try{ return await fn(); } finally{ inflight.delete(k); } })(); inflight.set(k,p); return p;
 }
 
 const COMMON_HEADERS = { "User-Agent":"SportsHQ/1.0 (+render.com)", "Accept":"application/json" };
@@ -75,79 +74,45 @@ function isRecentFinal(m){ const raw=m.strStatus||m.strProgress||""; if(!isFinal
   const t=eventMillis(m).ms; return Number.isFinite(t) && (Date.now()-t)<=FINAL_KEEP_MS;
 }
 
-// Parse many formats → milliseconds (UTC). Returns {ms, dateOnly, ymd}.
+// Robust parser (epoch, iso, "YYYY-MM-DD HH:MM[:SS][zone?]", date-only, TBA)
 function parseFlexibleDate(str){
   if (str == null) return NaN;
-  if (typeof str !== "string"){
-    const n=Number(str); if (Number.isFinite(n)) return n>1e12?n:n*1000; return NaN;
-  }
+  if (typeof str !== "string"){ const n=Number(str); return Number.isFinite(n)?(n>1e12?n:n*1000):NaN; }
   const s=str.trim(); if (!s) return NaN;
-
-  // epoch
   if (/^\d{13}$/.test(s)) return +s;
   if (/^\d{10}$/.test(s)) return +s*1000;
-
-  // ISO or "YYYY-MM-DD HH:MM[:SS][zone?]"
   if (/^\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(:\d{2})?/.test(s)){
-    let w = s.replace(" ", "T");
-    // normalize zone forms like -0500 -> -05:00
-    w = w.replace(/([+\-]\d{2})(\d{2})$/, "$1:$2");
-    if (!/[Zz]|[+\-]\d{2}:\d{2}$/.test(w)) w += "Z";
+    let w=s.replace(" ","T").replace(/([+\-]\d{2})(\d{2})$/, "$1:$2");
+    if (!/[Zz]|[+\-]\d{2}:\d{2}$/.test(w)) w+="Z";
     const ms=Date.parse(w); if (Number.isFinite(ms)) return ms;
   }
-
-  // Direct parse fallback (handles "YYYY-MM-DDZ" etc.)
   const direct=Date.parse(s); if (Number.isFinite(direct)) return direct;
-
-  // Pure date → noon UTC anchor
-  const m=s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (m){ const Y=+m[1], M=+m[2]-1, D=+m[3]; return Date.UTC(Y,M,D,12,0,0); }
-
+  const m=s.match(/^(\d{4})-(\d{2})-(\d{2})$/); if (m){ const Y=+m[1], M=+m[2]-1, D=+m[3]; return Date.UTC(Y,M,D,12,0,0); }
   return NaN;
 }
-function isTBA(t){ if(!t) return true; const s=String(t).trim().toLowerCase(); return !s || s==="tba"||s==="tbd"||s==="ns"||s==="00:00:00"||s==="00:00:00z"||s==="00:00:00+00:00"; }
-
+function isTBA(t){ if(!t) return true; const s=String(t).trim().toLowerCase(); return !s||s==="tba"||s==="tbd"||s==="ns"||s==="00:00:00"||s==="00:00:00z"||s==="00:00:00+00:00"; }
 function eventMillis(m){
-  // explicit stamps first
-  let ms = parseFlexibleDate(m.strTimestampMS); if (Number.isFinite(ms)) return {ms, dateOnly:false, ymd:new Date(ms).toISOString().slice(0,10)};
-  ms = parseFlexibleDate(m.strTimestamp);       if (Number.isFinite(ms)) return {ms, dateOnly:false, ymd:new Date(ms).toISOString().slice(0,10)};
-
-  const tryCombo = (d,t)=>{
-    if(!d) return {ms:NaN, dateOnly:false, ymd:""};
-    const ds = String(d).trim(); const ymd = ds.slice(0,10);
-    if (isTBA(t)) {
-      const base = parseFlexibleDate(ds); // pure date → noon UTC
-      return {ms:base, dateOnly:true, ymd};
-    }
-    const tt  = String(t).trim().replace(/([+\-]\d{2})(\d{2})$/, "$1:$2");
-    const iso = /[Zz]|[+\-]\d{2}:\d{2}$/.test(tt) ? `${ds}T${tt}` : `${ds}T${tt}Z`;
-    const msec = Date.parse(iso);
-    return {ms:msec, dateOnly:false, ymd};
+  let ms=parseFlexibleDate(m.strTimestampMS); if (Number.isFinite(ms)) return {ms, dateOnly:false, ymd:new Date(ms).toISOString().slice(0,10)};
+  ms=parseFlexibleDate(m.strTimestamp);       if (Number.isFinite(ms)) return {ms, dateOnly:false, ymd:new Date(ms).toISOString().slice(0,10)};
+  const tryCombo=(d,t)=>{
+    if(!d) return {ms:NaN,dateOnly:false,ymd:""};
+    const ds=String(d).trim(); const ymd=ds.slice(0,10);
+    if (isTBA(t)){ const base=parseFlexibleDate(ds); return {ms:base,dateOnly:true,ymd}; }
+    const tt=String(t).trim().replace(/([+\-]\d{2})(\d{2})$/, "$1:$2");
+    const iso=/[Zz]|[+\-]\d{2}:\d{2}$/.test(tt)?`${ds}T${tt}`:`${ds}T${tt}Z`;
+    const msec=Date.parse(iso); return {ms:msec,dateOnly:false,ymd};
   };
-
-  for (const [d,t] of [
-    [m.dateEvent,      m.strTime],
-    [m.dateEventLocal, m.strTimeLocal],
-    [m.dateEvent,      null],
-    [m.dateEventLocal, null],
-  ]){
-    const r = tryCombo(d,t);
-    if (Number.isFinite(r.ms)) return r;
+  for (const [d,t] of [[m.dateEvent,m.strTime],[m.dateEventLocal,m.strTimeLocal],[m.dateEvent,null],[m.dateEventLocal,null]]){
+    const r=tryCombo(d,t); if (Number.isFinite(r.ms)) return r;
   }
-
-  // last resorts
-  ms = parseFlexibleDate(m.strDate); if (Number.isFinite(ms)) return {ms, dateOnly:false, ymd:new Date(ms).toISOString().slice(0,10)};
-  ms = parseFlexibleDate(m.date);    if (Number.isFinite(ms)) return {ms, dateOnly:false, ymd:new Date(ms).toISOString().slice(0,10)};
-  return {ms:NaN, dateOnly:false, ymd:""};
+  ms=parseFlexibleDate(m.strDate); if (Number.isFinite(ms)) return {ms,dateOnly:false,ymd:new Date(ms).toISOString().slice(0,10)};
+  ms=parseFlexibleDate(m.date);    if (Number.isFinite(ms)) return {ms,dateOnly:false,ymd:new Date(ms).toISOString().slice(0,10)};
+  return {ms:NaN,dateOnly:false,ymd:""};
 }
-
 function futureOK(ev, nowMs){
   const {ms, dateOnly, ymd} = eventMillis(ev);
   if (Number.isFinite(ms) && ms >= nowMs) return true;
-  if (dateOnly){
-    const today = new Date(nowMs).toISOString().slice(0,10);
-    return ymd >= today; // date-only: calendar-aware
-  }
+  if (dateOnly){ const today=new Date(nowMs).toISOString().slice(0,10); return ymd >= today; }
   return false;
 }
 
@@ -164,8 +129,8 @@ function sortForDisplay(a,b){
   const ta=eventMillis(a).ms, tb=eventMillis(b).ms;
   const aBad=!Number.isFinite(ta), bBad=!Number.isFinite(tb);
   if (aBad && !bBad) return +1; if (!aBad && bBad) return -1;
-  if (sa==="Final") return tb - ta; // newest finals
-  return ta - tb;                   // soonest
+  if (sa==="Final") return tb - ta;
+  return ta - tb;
 }
 
 // ===== TSDB wrappers =====
@@ -177,13 +142,14 @@ async function v2Livescore(sport){
   ];
   const out=[]; for (const u of urls){ const j=await memoJson(u, TTL.LIVE, V2_KEY?{"X-API-KEY":V2_KEY}:{});
     if (Array.isArray(j?.livescore)) out.push(...j.livescore);
-  }
-  return out;
+  } return out;
 }
-const V1 = (p)=>`https://www.thesportsdb.com/api/v1/json/${V1_KEY||"3"}/${p}`;
+const V1 = p => `https://www.thesportsdb.com/api/v1/json/${V1_KEY||"3"}/${p}`;
 async function v1NextLeague(id){ const j=await memoJson(V1(`eventsnextleague.php?id=${id}`), TTL.NEXT); return Array.isArray(j?.events)?j.events:[]; }
 async function v1Season(id,s){ const j=await memoJson(V1(`eventsseason.php?id=${id}&s=${encodeURIComponent(s)}`), TTL.SEASON); return Array.isArray(j?.events)?j.events:[]; }
 async function v1PastLeague(id){ const j=await memoJson(V1(`eventspastleague.php?id=${id}`), TTL.PAST); return Array.isArray(j?.events)?j.events:[]; }
+const SPORT_LABEL={ soccer:"Soccer", basketball:"Basketball", american_football:"American Football", ice_hockey:"Ice Hockey" };
+async function v1EventsDay(sport, ymd){ const label=SPORT_LABEL[sport]||sport; const j=await memoJson(V1(`eventsday.php?d=${ymd}&s=${encodeURIComponent(label)}`), TTL.DAY); return Array.isArray(j?.events)?j.events:[]; }
 
 // ===== seasons & leagues =====
 function guessSeasonCrossYear(){ const d=new Date(), y=d.getUTCFullYear(), m=d.getUTCMonth()+1; const start=(m>=7)?y:y-1; return `${start}-${start+1}`; }
@@ -204,63 +170,51 @@ function formatMatch(m){
            headline:`${home} vs ${away} - ${status}`, start:Number.isFinite(ms)?new Date(ms).toISOString():null };
 }
 
-// ===== core unified builder with rescue =====
+// ===== LIGHTWEIGHT DAY FILL (used only if still short) =====
+async function dayFill({sport, leagueId, out, need, maxDays=35, maxCalls=12}){
+  const now=Date.now();
+  const today=new Date();
+  let calls=0;
+  for (let d=0; d<=maxDays && out.length<need; d++){
+    if (calls >= maxCalls) break;
+    const ymd=new Date(today.getTime()+d*86400000).toISOString().slice(0,10);
+    const rows=await v1EventsDay(sport, ymd); calls++;
+    const fut=(rows||[])
+      .filter(m => String(m.idLeague||"")===String(leagueId))
+      .filter(m => futureOK(m, now))
+      .sort((a,b)=>eventMillis(a).ms - eventMillis(b).ms);
+    for (const m of fut){ if (out.length>=need) break; pushUnique(out,m); }
+  }
+  console.log(`[dayfill ${sport}:${leagueId}] +${out.length}/${need} (days<=${Math.min(maxDays, calls)})`);
+}
+
+// ===== unified builder =====
 async function buildSingle({ sport, leagueId, seasons, n }){
   const now = Date.now();
   const finals=[], live=[], sched=[];
 
-  // Finals
-  const past = await v1PastLeague(leagueId);
+  const past=await v1PastLeague(leagueId);
   for (const m of (past||[])) if (isRecentFinal(m)) pushUnique(finals, m);
   finals.sort((a,b)=>eventMillis(b).ms - eventMillis(a).ms);
 
-  // Live
-  const ls = await v2Livescore(sport);
-  for (const m of (ls||[])) if (String(m.idLeague||"")===String(leagueId) && !isRecentFinal(m)) pushUnique(live, m);
+  const ls=await v2Livescore(sport);
+  for (const m of (ls||[])) if (String(m.idLeague||"")===String(leagueId)&&!isRecentFinal(m)) pushUnique(live, m);
 
-  // Next (cheap)
-  const next = await v1NextLeague(leagueId);
-  const nextFut = (next||[]).filter(e=>futureOK(e, now)).sort((a,b)=>eventMillis(a).ms - eventMillis(b).ms);
-  for (const m of nextFut){ if(finals.length+live.length+sched.length>=n) break; pushUnique(sched, m); }
-
-  // Seasons (robust + rescue)
-  const exDumped = { val:false };
-  const today = new Date(now).toISOString().slice(0,10);
+  const next=await v1NextLeague(leagueId);
+  const nextFut=(next||[]).filter(e=>futureOK(e, now)).sort((a,b)=>eventMillis(a).ms - eventMillis(b).ms);
+  for (const m of nextFut){ if (finals.length+live.length+sched.length>=n) break; pushUnique(sched, m); }
 
   for (const s of seasons){
-    if (finals.length+live.length+sched.length >= n) break;
-    const rows = await v1Season(leagueId, s);
-    const raw  = rows || [];
+    if (finals.length+live.length+sched.length>=n) break;
+    const rows=await v1Season(leagueId, s);
+    const fut=(rows||[]).filter(e=>futureOK(e, now)).sort((a,b)=>eventMillis(a).ms - eventMillis(b).ms);
+    for (const m of fut){ if (finals.length+live.length+sched.length>=n) break; pushUnique(sched, m); }
+  }
 
-    let fut = raw.filter(e=>futureOK(e, now)).sort((a,b)=>eventMillis(a).ms - eventMillis(b).ms);
-
-    if (fut.length === 0 && raw.length > 0){
-      // RESCUE: rebuild from dateEvent/dateEventLocal only
-      const rescued = [];
-      for (const m of raw){
-        const de = (m.dateEventLocal||m.dateEvent||"").slice(0,10);
-        if (/^\d{4}-\d{2}-\d{2}$/.test(de) && de >= today){
-          // anchor to noon UTC
-          const [Y,M,D] = de.split("-").map(Number);
-          m.__rescuedMS = Date.UTC(Y, M-1, D, 12, 0, 0);
-          rescued.push(m);
-          if (!exDumped.val){
-            console.log("[exDates]", JSON.stringify({
-              idLeague:m.idLeague, idEvent:m.idEvent, dateEvent:m.dateEvent, strTime:m.strTime,
-              dateEventLocal:m.dateEventLocal, strTimeLocal:m.strTimeLocal, strTimestamp:m.strTimestamp, strTimestampMS:m.strTimestampMS
-            }));
-            exDumped.val = true;
-          }
-        }
-      }
-      rescued.sort((a,b)=> (a.__rescuedMS||0) - (b.__rescuedMS||0));
-      fut = rescued;
-    }
-
-    for (const m of fut){
-      if (finals.length+live.length+sched.length>=n) break;
-      pushUnique(sched, m);
-    }
+  // fallback day fill if still short (this is the missing piece for your case)
+  const have = finals.length+live.length+sched.length;
+  if (have < n){
+    await dayFill({ sport, leagueId, out: sched, need: n - have, maxDays: 42, maxCalls: 12 });
   }
 
   const out=[...finals, ...live, ...sched].sort(sortForDisplay).slice(0,n);
@@ -272,7 +226,7 @@ async function buildSingle({ sport, leagueId, seasons, n }){
 async function getBoardCached(key, builder){
   const c=getCache(key); if (c.hit && c.fresh) return c.val;
   const fetcher=async()=>{ const data=await builder(); const full=Array.isArray(data)&&data.length>=DEFAULT_COUNT;
-    setCache(key, data, full ? TTL.OUT : 8_000); return data; };
+    setCache(key,data, full?TTL.OUT:8_000); return data; };
   if (c.hit && !c.fresh){ withInflight(key, fetcher); return c.val; }
   return withInflight(key, fetcher);
 }
@@ -280,8 +234,8 @@ async function getBoardCached(key, builder){
 // ===== routes =====
 app.get("/scores/soccer", async (req,res)=>{
   try{
-    const n = Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
-    const items = await getBoardCached(`OUT:soccer_epl_v28:${n}`, () =>
+    const n=Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
+    const items=await getBoardCached(`OUT:soccer_epl_v29:${n}`, () =>
       buildSingle({ sport:"soccer", leagueId:L.EPL, seasons:seasonsSoccer(), n })
     );
     res.json(items.map(formatMatch));
@@ -291,14 +245,14 @@ app.get("/scores/nfl", async (req,res)=>serveSingle(req,res,"american_football",
 app.get("/scores/nba", async (req,res)=>serveSingle(req,res,"basketball",        L.NBA, seasonsDefault()));
 app.get("/scores/nhl", async (req,res)=>serveSingle(req,res,"ice_hockey",        L.NHL, seasonsDefault()));
 
-// Aliases (keep client compatibility)
+// Aliases for old client paths
 app.get("/scores/american_football", (req,res)=>serveSingle(req,res,"american_football", L.NFL, seasonsNFL()));
 app.get("/scores/basketball",        (req,res)=>serveSingle(req,res,"basketball",        L.NBA, seasonsDefault()));
 
 async function serveSingle(req,res,sport,leagueId,seasons){
   try{
-    const n = Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
-    const items = await getBoardCached(`OUT:${sport}:${leagueId}:v28:${n}`, () =>
+    const n=Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
+    const items=await getBoardCached(`OUT:${sport}:${leagueId}:v29:${n}`, () =>
       buildSingle({ sport, leagueId, seasons, n })
     );
     res.json(items.map(formatMatch));
