@@ -1,12 +1,11 @@
-// server.js — Simple 3+1 v2 + DEBUG route
-// Order: Finals(≤15m) → Live → Scheduled (soonest). Season backfill, strong SWR.
-// Debug route: /debug/:board  (soccer|nfl|nba|nhl) — reports upstream availability.
+// server.js — v18: EPL wide sweep + sequential fallback, strong SWR, debug route
+// Order: Finals (≤15m) → Live → Scheduled (soonest). Low-load, cache-first design.
 
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ simple-3+1 v2 + debug";
+const BUILD = "SportsHQ v18 (EPL wide sweep + sequential fallback + SWR + debug)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 // fetch polyfill for Node < 18
@@ -20,25 +19,25 @@ const SPORT_LABEL = { soccer: "Soccer", basketball: "Basketball", american_footb
 
 const DEFAULT_N = 10;
 
-// EPL backfill days (Fri–Mon) & horizon
-const EPL_DOW   = [5, 6, 0, 1];
-const EPL_WEEKS = 4;                 // ~16 day calls max (cached 30m)
+// WIDE EPL sweep: all days, 12 weeks (cached per day => cheap after first pass)
+const EPL_DOW   = [0,1,2,3,4,5,6];
+const EPL_WEEKS = 12;
 
-// NFL backfill days (Thu/Sat/Sun/Mon) & horizon
-const NFL_DOW   = [4, 6, 0, 1];
+// NFL: still focused on its typical days, 4 weeks is fine
+const NFL_DOW   = [4,6,0,1];  // Thu / Sat / Sun / Mon
 const NFL_WEEKS = 4;
 
-// NBA/NHL backfill: next 3 weeks (all days)
+// NBA/NHL: 3 weeks all days
 const DAILY_DOW   = [0,1,2,3,4,5,6];
 const DAILY_WEEKS = 3;
 
 const TTL = {
-  LIVE:   15_000,       // livescore refresh
-  NEXT:    5*60_000,    // next-league
-  PAST:   10*60_000,    // recent finals
-  DAY:    30*60_000,    // eventsday
-  SEASON:  6*60*60_000, // eventsseason (very long)
-  OUT:     90_000       // final board response TTL
+  LIVE:   15_000,
+  NEXT:    5*60_000,
+  PAST:   10*60_000,
+  DAY:    30*60_000,
+  SEASON:  6*60*60_000,
+  OUT:     90_000
 };
 const SWR_EXTRA = 5 * 60_000;
 
@@ -161,7 +160,6 @@ function eventMillis(m){
   const ms=parseMs(m.strTimestampMS)||parseMs(m.strTimestamp); if (Number.isFinite(ms)) return {ms, dateOnly:false, ymd:new Date(ms).toISOString().slice(0,10)};
   return {ms:NaN, dateOnly:false, ymd:""};
 }
-
 function futureOK(ev, now){
   const {ms,dateOnly,ymd} = eventMillis(ev);
   if (Number.isFinite(ms) && ms >= now) return true;
@@ -192,7 +190,7 @@ function sortForDisplay(a,b){
   return ta-tb;
 }
 
-/* ---------- tiny day sweep ---------- */
+/* ---------- date helpers ---------- */
 function sweepDates(weeks, dows){
   const out = new Set();
   const now = new Date();
@@ -208,13 +206,14 @@ function sweepDates(weeks, dows){
   return Array.from(out).sort();
 }
 
-/* ---------- season helpers ---------- */
 function crossYearNow(){ const d=new Date(), y=d.getUTCFullYear(), m=d.getUTCMonth()+1; const start=(m>=7)?y:y-1; return `${start}-${start+1}`; }
 function seasonCandidates(sport, leagueId){
   const y=(new Date()).getUTCFullYear(), cross=crossYearNow();
   if (leagueId===L.NFL) return [String(y), String(y+1), String(y-1)];
   return [cross, `${y}-${y+1}`, `${y-1}-${y}`];
 }
+
+/* ---------- season backfill ---------- */
 async function seasonBackfill({ sport, leagueId, out, n }){
   const now = Date.now();
   for (const s of seasonCandidates(sport, leagueId)){
@@ -230,8 +229,28 @@ async function seasonBackfill({ sport, leagueId, out, n }){
   }
 }
 
-/* ---------- the generic builder ---------- */
-async function buildBoard({ sport, leagueId, n, backfillWeeks, backfillDOW }) {
+/* ---------- soccer-specific: sequential forward fallback ---------- */
+async function sequentialDayFill({ sport, leagueId, out, need, maxDays = 90, maxCalls = 40 }){
+  if (need <= 0) return;
+  const now = Date.now();
+  const today = new Date(); today.setUTCHours(0,0,0,0);
+  let calls = 0;
+  for (let d=0; d<maxDays && out.length < need && calls < maxCalls; d++){
+    const ymd = new Date(today.getTime() + d*86400000).toISOString().slice(0,10);
+    const rows = await v1EventsDay(sport, ymd); calls++;
+    const keep = (rows||[])
+      .filter(m => String(m.idLeague||"") === String(leagueId))
+      .filter(m => futureOK(m, now))
+      .sort((a,b)=>eventMillis(a).ms - eventMillis(b).ms);
+    for (const m of keep){
+      if (out.length >= need) break;
+      pushUnique(out, m);
+    }
+  }
+}
+
+/* ---------- generic builder ---------- */
+async function buildBoard({ sport, leagueId, n, backfillWeeks, backfillDOW, isSoccerEPL=false }) {
   const now = Date.now();
   const finals = [], live = [], sched = [];
 
@@ -249,7 +268,7 @@ async function buildBoard({ sport, leagueId, n, backfillWeeks, backfillDOW }) {
   const futNext = (next||[]).filter(m=>futureOK(m, now)).sort((a,b)=>eventMillis(a).ms - eventMillis(b).ms);
   for (const m of futNext){ if (finals.length+live.length+sched.length >= n) break; pushUnique(sched, m); }
 
-  // tiny day sweep
+  // 4) wide day sweep
   if (finals.length+live.length+sched.length < n){
     const dates = sweepDates(backfillWeeks, backfillDOW);
     for (const ymd of dates){
@@ -266,7 +285,13 @@ async function buildBoard({ sport, leagueId, n, backfillWeeks, backfillDOW }) {
     }
   }
 
-  // season backfill (single, long-TTL) — guarantees fill without hammering
+  // 5) soccer EPL: sequential daily fallback (guarantee fill)
+  if (isSoccerEPL && (finals.length+live.length+sched.length) < n){
+    const need = n - (finals.length+live.length+sched.length);
+    await sequentialDayFill({ sport, leagueId, out: sched, need, maxDays: 90, maxCalls: 40 });
+  }
+
+  // 6) season backfill (single, long-TTL)
   if (finals.length+live.length+sched.length < n){
     await seasonBackfill({ sport, leagueId, out: sched, n: n - (finals.length+live.length) });
   }
@@ -285,7 +310,7 @@ async function getBoardCached(key, ttl, builder){
     const data = await builder();
     // If new data is shorter than last known board, keep the longer one
     if (c.hit && Array.isArray(c.val) && (data?.length||0) < (c.val?.length||0)) {
-      setC(key, c.val, ttl);   // keep serving the longer board
+      setC(key, c.val, ttl);
       return c.val;
     }
     setC(key, data || [], ttl);
@@ -308,14 +333,15 @@ function fmt(m){
            headline:`${home} vs ${away} - ${status}`, start:Number.isFinite(ms)?new Date(ms).toISOString():null };
 }
 
-/* ---------- routes (UNCHANGED logic) ---------- */
-// Soccer = EPL only
+/* ---------- routes ---------- */
+// Soccer = EPL only (wide sweep + sequential fallback)
 app.get("/scores/soccer", async (req,res)=>{
   const n = Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_N,10)||DEFAULT_N));
-  const key = `OUT:soccer:${L.EPL}:${n}:v2`;
+  const bust = req.query.nocache ? `:${Date.now()}` : "";
+  const key = `OUT:soccer:${L.EPL}:${n}:v18${bust}`;
   const rows = await getBoardCached(key, TTL.OUT, ()=>buildBoard({
     sport: "soccer", leagueId: L.EPL, n,
-    backfillWeeks: EPL_WEEKS, backfillDOW: EPL_DOW
+    backfillWeeks: EPL_WEEKS, backfillDOW: EPL_DOW, isSoccerEPL: true
   }));
   res.json(rows.map(fmt));
 });
@@ -323,7 +349,8 @@ app.get("/scores/soccer", async (req,res)=>{
 // NFL
 app.get("/scores/nfl", async (req,res)=>{
   const n = Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_N,10)||DEFAULT_N));
-  const key = `OUT:nfl:${L.NFL}:${n}:v2`;
+  const bust = req.query.nocache ? `:${Date.now()}` : "";
+  const key = `OUT:nfl:${L.NFL}:${n}:v18${bust}`;
   const rows = await getBoardCached(key, TTL.OUT, ()=>buildBoard({
     sport: "american_football", leagueId: L.NFL, n,
     backfillWeeks: NFL_WEEKS, backfillDOW: NFL_DOW
@@ -334,7 +361,8 @@ app.get("/scores/nfl", async (req,res)=>{
 // NBA
 app.get("/scores/nba", async (req,res)=>{
   const n = Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_N,10)||DEFAULT_N));
-  const key = `OUT:nba:${L.NBA}:${n}:v2`;
+  const bust = req.query.nocache ? `:${Date.now()}` : "";
+  const key = `OUT:nba:${L.NBA}:${n}:v18${bust}`;
   const rows = await getBoardCached(key, TTL.OUT, ()=>buildBoard({
     sport: "basketball", leagueId: L.NBA, n,
     backfillWeeks: DAILY_WEEKS, backfillDOW: DAILY_DOW
@@ -345,7 +373,8 @@ app.get("/scores/nba", async (req,res)=>{
 // NHL
 app.get("/scores/nhl", async (req,res)=>{
   const n = Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_N,10)||DEFAULT_N));
-  const key = `OUT:nhl:${L.NHL}:${n}:v2`;
+  const bust = req.query.nocache ? `:${Date.now()}` : "";
+  const key = `OUT:nhl:${L.NHL}:${n}:v18${bust}`;
   const rows = await getBoardCached(key, TTL.OUT, ()=>buildBoard({
     sport: "ice_hockey", leagueId: L.NHL, n,
     backfillWeeks: DAILY_WEEKS, backfillDOW: DAILY_DOW
@@ -353,7 +382,7 @@ app.get("/scores/nhl", async (req,res)=>{
   res.json(rows.map(fmt));
 });
 
-/* ---------- PT1: DEBUG route (NEW) ---------- */
+/* ---------- DEBUG route (unchanged) ---------- */
 app.get("/debug/:board", async (req, res) => {
   try {
     const name = String(req.params.board || "").toLowerCase();
@@ -418,4 +447,3 @@ app.get("/debug/:board", async (req, res) => {
 /* ---------- health ---------- */
 app.get("/health",(_,res)=>res.json({ok:true}));
 app.listen(PORT, ()=>console.log(`Server listening on ${PORT} — ${BUILD}`));
-
