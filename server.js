@@ -1,10 +1,10 @@
-// server.js — v27: final fix for date-only/TBA rows (EPL/NFL), aliases for old paths, low-load SWR.
+// server.js — v28: final fix for date-only/TBA NFL/EPL rows (+rescue), low-load SWR, aliases kept.
 
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ v27 (date-only/TBA future fix + aliases)";
+const BUILD = "SportsHQ v28 (robust date parser + season rescue + aliases)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 if (typeof fetch !== "function") {
@@ -17,31 +17,39 @@ const V1_KEY = process.env.TSDB_V1_KEY || "";
 if (!V2_KEY) console.warn("ℹ️ TSDB_V2_KEY missing (live may be limited)");
 if (!V1_KEY) console.warn("ℹ️ TSDB_V1_KEY missing; using shared/test key");
 
-// ===== CONFIG =====
+// ===== CONFIG / CACHE =====
 const DEFAULT_COUNT = 10;
 const TTL = { LIVE:15_000, NEXT:5*60_000, SEASON:3*60*60_000, PAST:10*60_000, OUT:60_000 };
 const SWR_EXTRA = 5*60_000;
 
-const cache=new Map(), inflight=new Map();
-function getCache(k){const e=cache.get(k); if(!e) return {hit:false}; const now=Date.now(); if(now<=e.exp) return {hit:true,fresh:true,val:e.val}; if(now<=e.swr) return {hit:true,fresh:false,val:e.val}; return {hit:false};}
-function setCache(k,val,ttl){const now=Date.now(); cache.set(k,{val,exp:now+ttl,swr:now+ttl+SWR_EXTRA});}
-async function withInflight(k,fn){ if(inflight.has(k)) return inflight.get(k); const p=(async()=>{ try{return await fn();} finally{inflight.delete(k);} })(); inflight.set(k,p); return p; }
+const cache = new Map(), inflight = new Map();
+function getCache(k){ const e=cache.get(k); if(!e) return {hit:false}; const now=Date.now();
+  if (now<=e.exp) return {hit:true,fresh:true,val:e.val};
+  if (now<=e.swr) return {hit:true,fresh:false,val:e.val};
+  return {hit:false};
+}
+function setCache(k,val,ttl){ const now=Date.now(); cache.set(k,{val,exp:now+ttl,swr:now+ttl+SWR_EXTRA}); }
+async function withInflight(k,fn){ if(inflight.has(k)) return inflight.get(k);
+  const p=(async()=>{ try{ return await fn(); } finally{ inflight.delete(k); } })();
+  inflight.set(k,p); return p;
+}
 
-const COMMON_HEADERS={ "User-Agent":"SportsHQ/1.0 (+render.com)", "Accept":"application/json" };
-const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-const jitter=ms=>ms+Math.floor(Math.random()*(ms/3));
+const COMMON_HEADERS = { "User-Agent":"SportsHQ/1.0 (+render.com)", "Accept":"application/json" };
+const sleep=ms=>new Promise(r=>setTimeout(r,ms)); const jitter=ms=>ms+Math.floor(Math.random()*(ms/3));
 async function fetchJsonRetry(url, extra={}, tries=4, baseDelay=650){
   let lastErr;
   for (let i=0;i<tries;i++){
     try{
       const res=await fetch(url,{headers:{...COMMON_HEADERS,...extra}});
       const txt=await res.text();
-      if(res.status===429){ const ra=Number(res.headers?.get("retry-after"))||0; const wait=jitter(ra?ra*1000:baseDelay*Math.pow(2,i)); console.warn(`[429] wait ${wait}ms :: ${url}`); await sleep(wait); continue; }
-      if(!res.ok) throw new Error(`${res.status} ${res.statusText} | ${txt.slice(0,160)}`);
+      if (res.status===429){ const ra=Number(res.headers?.get("retry-after"))||0; const wait=jitter(ra?ra*1000:baseDelay*Math.pow(2,i));
+        console.warn(`[429] wait ${wait}ms :: ${url}`); await sleep(wait); continue; }
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText} | ${txt.slice(0,200)}`);
       return JSON.parse(txt);
     }catch(e){ lastErr=e; const wait=jitter(baseDelay*Math.pow(2,i)); console.warn(`[retry] ${e.message}; wait ${wait}ms :: ${url}`); await sleep(wait); }
   }
-  console.error(`[FAIL] ${lastErr?.message} :: ${url}`); return null;
+  console.error(`[FAIL] ${lastErr?.message}`);
+  return null;
 }
 async function memoJson(url, ttl, extra={}){
   const key=`URL:${url}`; const c=getCache(key);
@@ -51,7 +59,7 @@ async function memoJson(url, ttl, extra={}){
   return withInflight(key, fetcher);
 }
 
-// ===== status helpers =====
+// ===== time helpers =====
 function pickScore(v){ return (v===undefined||v===null||v===""||v==="N/A")?null:v; }
 function isLiveWord(s=""){ s=(s+"").toLowerCase(); return s.includes("live")||s.includes("in play")||s.includes("half")||s==="ht"||s.includes("ot"); }
 function isFinalWord(s=""){ s=(s+"").toLowerCase(); return s.includes("final")||s==="ft"||s.includes("full time"); }
@@ -62,42 +70,45 @@ function normalizeStatus(m,s1,s2){
   if (!raw||raw==="NS"||raw.toLowerCase()==="scheduled"||raw.toLowerCase()==="preview") return "Scheduled";
   return has ? raw : "Scheduled";
 }
-const FINAL_KEEP_MS=15*60*1000;
-function isRecentFinal(m){
-  const raw=m.strStatus||m.strProgress||""; if(!isFinalWord(raw)) return false;
-  const ms=eventMillis(m).ms; if(!Number.isFinite(ms)) return false;
-  return (Date.now()-ms)<=FINAL_KEEP_MS;
+const FINAL_KEEP_MS = 15*60*1000;
+function isRecentFinal(m){ const raw=m.strStatus||m.strProgress||""; if(!isFinalWord(raw)) return false;
+  const t=eventMillis(m).ms; return Number.isFinite(t) && (Date.now()-t)<=FINAL_KEEP_MS;
 }
 
-// ===== hardened time parsing (handles date-only + TBA correctly) =====
-function isTBA(t){
-  if (!t) return true;
-  const s=String(t).trim().toLowerCase();
-  return !s || s==="tba" || s==="tbd" || s==="ns" || s==="00:00:00" || s==="00:00:00z" || s==="00:00:00+00:00";
-}
+// Parse many formats → milliseconds (UTC). Returns {ms, dateOnly, ymd}.
 function parseFlexibleDate(str){
   if (str == null) return NaN;
-  if (typeof str !== "string") {
-    const n = Number(str); if (Number.isFinite(n)) return n > 1e12 ? n : n*1000; return NaN;
+  if (typeof str !== "string"){
+    const n=Number(str); if (Number.isFinite(n)) return n>1e12?n:n*1000; return NaN;
   }
-  const s = str.trim(); if (!s) return NaN;
-  if (/^\d{13}$/.test(s)) return +s;          // epoch ms
-  if (/^\d{10}$/.test(s)) return +s * 1000;   // epoch sec
-  if (/^\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(:\d{2})?/.test(s)) {
-    const withT = s.replace(" ", "T");
-    const hasTZ = /Z$|[+\-]\d\d:?\d\d$/.test(withT);
-    const iso   = hasTZ ? withT : (withT + "Z");
-    const ms = Date.parse(iso); if (Number.isFinite(ms)) return ms;
+  const s=str.trim(); if (!s) return NaN;
+
+  // epoch
+  if (/^\d{13}$/.test(s)) return +s;
+  if (/^\d{10}$/.test(s)) return +s*1000;
+
+  // ISO or "YYYY-MM-DD HH:MM[:SS][zone?]"
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}(:\d{2})?/.test(s)){
+    let w = s.replace(" ", "T");
+    // normalize zone forms like -0500 -> -05:00
+    w = w.replace(/([+\-]\d{2})(\d{2})$/, "$1:$2");
+    if (!/[Zz]|[+\-]\d{2}:\d{2}$/.test(w)) w += "Z";
+    const ms=Date.parse(w); if (Number.isFinite(ms)) return ms;
   }
-  const direct = Date.parse(s); if (Number.isFinite(direct)) return direct;
-  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/); // date-only
-  if (m) { const Y=+m[1], M=+m[2]-1, D=+m[3]; return Date.UTC(Y, M, D, 12, 0, 0); }
+
+  // Direct parse fallback (handles "YYYY-MM-DDZ" etc.)
+  const direct=Date.parse(s); if (Number.isFinite(direct)) return direct;
+
+  // Pure date → noon UTC anchor
+  const m=s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m){ const Y=+m[1], M=+m[2]-1, D=+m[3]; return Date.UTC(Y,M,D,12,0,0); }
+
   return NaN;
 }
+function isTBA(t){ if(!t) return true; const s=String(t).trim().toLowerCase(); return !s || s==="tba"||s==="tbd"||s==="ns"||s==="00:00:00"||s==="00:00:00z"||s==="00:00:00+00:00"; }
 
-// Return {ms, dateOnly:bool, ymd:string}
 function eventMillis(m){
-  // explicit timestamps
+  // explicit stamps first
   let ms = parseFlexibleDate(m.strTimestampMS); if (Number.isFinite(ms)) return {ms, dateOnly:false, ymd:new Date(ms).toISOString().slice(0,10)};
   ms = parseFlexibleDate(m.strTimestamp);       if (Number.isFinite(ms)) return {ms, dateOnly:false, ymd:new Date(ms).toISOString().slice(0,10)};
 
@@ -105,14 +116,11 @@ function eventMillis(m){
     if(!d) return {ms:NaN, dateOnly:false, ymd:""};
     const ds = String(d).trim(); const ymd = ds.slice(0,10);
     if (isTBA(t)) {
-      // treat as date-only → noon UTC anchor
-      const base = parseFlexibleDate(ds); // date-only branch anchors to noon
+      const base = parseFlexibleDate(ds); // pure date → noon UTC
       return {ms:base, dateOnly:true, ymd};
     }
-    // true time → ISO (default to Z if no zone)
-    const tt = String(t).trim();
-    const hasTZ=/Z$|[+\-]\d\d:?\d\d$/.test(tt);
-    const iso = `${ds}T${tt}${hasTZ?"":"Z"}`;
+    const tt  = String(t).trim().replace(/([+\-]\d{2})(\d{2})$/, "$1:$2");
+    const iso = /[Zz]|[+\-]\d{2}:\d{2}$/.test(tt) ? `${ds}T${tt}` : `${ds}T${tt}Z`;
     const msec = Date.parse(iso);
     return {ms:msec, dateOnly:false, ymd};
   };
@@ -127,16 +135,19 @@ function eventMillis(m){
     if (Number.isFinite(r.ms)) return r;
   }
 
-  ms = parseFlexibleDate(m.strDate);   if (Number.isFinite(ms)) return {ms, dateOnly:false, ymd:new Date(ms).toISOString().slice(0,10)};
-  ms = parseFlexibleDate(m.date);      if (Number.isFinite(ms)) return {ms, dateOnly:false, ymd:new Date(ms).toISOString().slice(0,10)};
+  // last resorts
+  ms = parseFlexibleDate(m.strDate); if (Number.isFinite(ms)) return {ms, dateOnly:false, ymd:new Date(ms).toISOString().slice(0,10)};
+  ms = parseFlexibleDate(m.date);    if (Number.isFinite(ms)) return {ms, dateOnly:false, ymd:new Date(ms).toISOString().slice(0,10)};
   return {ms:NaN, dateOnly:false, ymd:""};
 }
 
-// “Is this future enough to show as scheduled?”
 function futureOK(ev, nowMs){
   const {ms, dateOnly, ymd} = eventMillis(ev);
-  if (Number.isFinite(ms) && ms >= nowMs) return true;        // normal case
-  if (dateOnly && ymd >= new Date(nowMs).toISOString().slice(0,10)) return true; // date-only ≥ today
+  if (Number.isFinite(ms) && ms >= nowMs) return true;
+  if (dateOnly){
+    const today = new Date(nowMs).toISOString().slice(0,10);
+    return ymd >= today; // date-only: calendar-aware
+  }
   return false;
 }
 
@@ -153,35 +164,38 @@ function sortForDisplay(a,b){
   const ta=eventMillis(a).ms, tb=eventMillis(b).ms;
   const aBad=!Number.isFinite(ta), bBad=!Number.isFinite(tb);
   if (aBad && !bBad) return +1; if (!aBad && bBad) return -1;
-  if (sa==="Final") return tb - ta;
-  return ta - tb;
+  if (sa==="Final") return tb - ta; // newest finals
+  return ta - tb;                   // soonest
 }
 
 // ===== TSDB wrappers =====
 async function v2Livescore(sport){
   const s=sport.replace(/_/g," ");
-  const urls=[`https://www.thesportsdb.com/api/v2/json/livescore/${encodeURIComponent(s)}`,
-              `https://www.thesportsdb.com/api/v2/json/livescore.php?s=${encodeURIComponent(s)}`];
-  const out=[]; for (const u of urls){ const j=await memoJson(u, TTL.LIVE, V2_KEY?{"X-API-KEY":V2_KEY}:{}); if (Array.isArray(j?.livescore)) out.push(...j.livescore); }
+  const urls=[
+    `https://www.thesportsdb.com/api/v2/json/livescore/${encodeURIComponent(s)}`,
+    `https://www.thesportsdb.com/api/v2/json/livescore.php?s=${encodeURIComponent(s)}`
+  ];
+  const out=[]; for (const u of urls){ const j=await memoJson(u, TTL.LIVE, V2_KEY?{"X-API-KEY":V2_KEY}:{});
+    if (Array.isArray(j?.livescore)) out.push(...j.livescore);
+  }
   return out;
 }
-const V1 = p => `https://www.thesportsdb.com/api/v1/json/${V1_KEY || "3"}/${p}`;
+const V1 = (p)=>`https://www.thesportsdb.com/api/v1/json/${V1_KEY||"3"}/${p}`;
 async function v1NextLeague(id){ const j=await memoJson(V1(`eventsnextleague.php?id=${id}`), TTL.NEXT); return Array.isArray(j?.events)?j.events:[]; }
 async function v1Season(id,s){ const j=await memoJson(V1(`eventsseason.php?id=${id}&s=${encodeURIComponent(s)}`), TTL.SEASON); return Array.isArray(j?.events)?j.events:[]; }
 async function v1PastLeague(id){ const j=await memoJson(V1(`eventspastleague.php?id=${id}`), TTL.PAST); return Array.isArray(j?.events)?j.events:[]; }
 
-// ===== seasons =====
+// ===== seasons & leagues =====
 function guessSeasonCrossYear(){ const d=new Date(), y=d.getUTCFullYear(), m=d.getUTCMonth()+1; const start=(m>=7)?y:y-1; return `${start}-${start+1}`; }
 function nextCross(s){ const a=parseInt(s.split("-")[0],10); return `${a+1}-${a+2}`; }
 function prevCross(s){ const a=parseInt(s.split("-")[0],10); return `${a-1}-${a}`; }
-function seasonCandidatesSoccer(){ const c=guessSeasonCrossYear(), y=(new Date()).getUTCFullYear(); return [c, nextCross(c), prevCross(c), String(y), String(y+1), String(y-1)]; }
-function seasonCandidatesNFL(){ const y=(new Date()).getUTCFullYear(), c=guessSeasonCrossYear(); return [String(y), String(y+1), String(y-1), c, nextCross(c), prevCross(c)]; }
-function seasonCandidatesDefault(){ const c=guessSeasonCrossYear(); return [c, nextCross(c), prevCross(c)]; }
+function seasonsSoccer(){ const c=guessSeasonCrossYear(), y=(new Date()).getUTCFullYear(); return [c, nextCross(c), prevCross(c), String(y), String(y+1), String(y-1)]; }
+function seasonsNFL(){ const y=(new Date()).getUTCFullYear(), c=guessSeasonCrossYear(); return [String(y), String(y+1), String(y-1), c, nextCross(c), prevCross(c)]; }
+function seasonsDefault(){ const c=guessSeasonCrossYear(); return [c, nextCross(c), prevCross(c)]; }
 
-// ===== leagues =====
 const L = { EPL:4328, NBA:4387, NFL:4391, NHL:4380 };
 
-// ===== format =====
+// ===== formatting =====
 function formatMatch(m){
   const home=m.strHomeTeam||m.homeTeam||m.strHome||"", away=m.strAwayTeam||m.awayTeam||m.strAway||"";
   const s1=pickScore(m.intHomeScore??m.intHomeGoals), s2=pickScore(m.intAwayScore??m.intAwayGoals);
@@ -190,29 +204,62 @@ function formatMatch(m){
            headline:`${home} vs ${away} - ${status}`, start:Number.isFinite(ms)?new Date(ms).toISOString():null };
 }
 
-// ===== unified builder =====
-async function buildSingle({ sport, leagueId, n, seasons }){
-  const now=Date.now();
+// ===== core unified builder with rescue =====
+async function buildSingle({ sport, leagueId, seasons, n }){
+  const now = Date.now();
   const finals=[], live=[], sched=[];
 
-  const past=await v1PastLeague(leagueId);
-  const finalsRaw=(past||[]).filter(isRecentFinal).sort((a,b)=>eventMillis(b).ms - eventMillis(a).ms);
-  for (const m of finalsRaw) pushUnique(finals, m);
+  // Finals
+  const past = await v1PastLeague(leagueId);
+  for (const m of (past||[])) if (isRecentFinal(m)) pushUnique(finals, m);
+  finals.sort((a,b)=>eventMillis(b).ms - eventMillis(a).ms);
 
-  const lsAll=await v2Livescore(sport);
-  const liveRaw=(lsAll||[]).filter(m=>String(m.idLeague||"")===String(leagueId)&&!isRecentFinal(m));
-  for (const m of liveRaw) pushUnique(live, m);
+  // Live
+  const ls = await v2Livescore(sport);
+  for (const m of (ls||[])) if (String(m.idLeague||"")===String(leagueId) && !isRecentFinal(m)) pushUnique(live, m);
 
-  const next=await v1NextLeague(leagueId);
-  const nextFut=(next||[]).filter(e=>futureOK(e, now)).sort((a,b)=>eventMillis(a).ms - eventMillis(b).ms);
-  for (const m of nextFut){ if(finals.length+live.length+sched.length>=n) break; pushUnique(sched,m); }
+  // Next (cheap)
+  const next = await v1NextLeague(leagueId);
+  const nextFut = (next||[]).filter(e=>futureOK(e, now)).sort((a,b)=>eventMillis(a).ms - eventMillis(b).ms);
+  for (const m of nextFut){ if(finals.length+live.length+sched.length>=n) break; pushUnique(sched, m); }
 
-  if (finals.length+live.length+sched.length < n){
-    for (const s of seasons){
-      if (finals.length+live.length+sched.length >= n) break;
-      const rows=await v1Season(leagueId, s);
-      const fut=(rows||[]).filter(e=>futureOK(e, now)).sort((a,b)=>eventMillis(a).ms - eventMillis(b).ms);
-      for (const m of fut){ if(finals.length+live.length+sched.length>=n) break; pushUnique(sched,m); }
+  // Seasons (robust + rescue)
+  const exDumped = { val:false };
+  const today = new Date(now).toISOString().slice(0,10);
+
+  for (const s of seasons){
+    if (finals.length+live.length+sched.length >= n) break;
+    const rows = await v1Season(leagueId, s);
+    const raw  = rows || [];
+
+    let fut = raw.filter(e=>futureOK(e, now)).sort((a,b)=>eventMillis(a).ms - eventMillis(b).ms);
+
+    if (fut.length === 0 && raw.length > 0){
+      // RESCUE: rebuild from dateEvent/dateEventLocal only
+      const rescued = [];
+      for (const m of raw){
+        const de = (m.dateEventLocal||m.dateEvent||"").slice(0,10);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(de) && de >= today){
+          // anchor to noon UTC
+          const [Y,M,D] = de.split("-").map(Number);
+          m.__rescuedMS = Date.UTC(Y, M-1, D, 12, 0, 0);
+          rescued.push(m);
+          if (!exDumped.val){
+            console.log("[exDates]", JSON.stringify({
+              idLeague:m.idLeague, idEvent:m.idEvent, dateEvent:m.dateEvent, strTime:m.strTime,
+              dateEventLocal:m.dateEventLocal, strTimeLocal:m.strTimeLocal, strTimestamp:m.strTimestamp, strTimestampMS:m.strTimestampMS
+            }));
+            exDumped.val = true;
+          }
+        }
+      }
+      rescued.sort((a,b)=> (a.__rescuedMS||0) - (b.__rescuedMS||0));
+      fut = rescued;
+    }
+
+    for (const m of fut){
+      if (finals.length+live.length+sched.length>=n) break;
+      pushUnique(sched, m);
     }
   }
 
@@ -223,35 +270,36 @@ async function buildSingle({ sport, leagueId, n, seasons }){
 
 // ===== cache wrapper =====
 async function getBoardCached(key, builder){
-  const c=getCache(key); if(c.hit && c.fresh) return c.val;
-  const fetcher=async()=>{ const data=await builder(); const full=Array.isArray(data)&&data.length>=DEFAULT_COUNT; setCache(key,data, full?TTL.OUT:8_000); return data; };
-  if(c.hit && !c.fresh){ withInflight(key, fetcher); return c.val; }
+  const c=getCache(key); if (c.hit && c.fresh) return c.val;
+  const fetcher=async()=>{ const data=await builder(); const full=Array.isArray(data)&&data.length>=DEFAULT_COUNT;
+    setCache(key, data, full ? TTL.OUT : 8_000); return data; };
+  if (c.hit && !c.fresh){ withInflight(key, fetcher); return c.val; }
   return withInflight(key, fetcher);
 }
 
 // ===== routes =====
 app.get("/scores/soccer", async (req,res)=>{
   try{
-    const n=Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
-    const items=await getBoardCached(`OUT:soccer_epl_v27:${n}`, () =>
-      buildSingle({ sport:"soccer", leagueId:L.EPL, n, seasons:seasonCandidatesSoccer() })
+    const n = Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
+    const items = await getBoardCached(`OUT:soccer_epl_v28:${n}`, () =>
+      buildSingle({ sport:"soccer", leagueId:L.EPL, seasons:seasonsSoccer(), n })
     );
     res.json(items.map(formatMatch));
   }catch(e){ console.error("soccer error:", e); res.status(500).json({error:"internal"}); }
 });
-app.get("/scores/nfl", async (req,res)=>serveSingle(req,res,"american_football", L.NFL, seasonCandidatesNFL()));
-app.get("/scores/nba", async (req,res)=>serveSingle(req,res,"basketball",        L.NBA, seasonCandidatesDefault()));
-app.get("/scores/nhl", async (req,res)=>serveSingle(req,res,"ice_hockey",        L.NHL, seasonCandidatesDefault()));
+app.get("/scores/nfl", async (req,res)=>serveSingle(req,res,"american_football", L.NFL, seasonsNFL()));
+app.get("/scores/nba", async (req,res)=>serveSingle(req,res,"basketball",        L.NBA, seasonsDefault()));
+app.get("/scores/nhl", async (req,res)=>serveSingle(req,res,"ice_hockey",        L.NHL, seasonsDefault()));
 
-// Aliases to match any old client paths
-app.get("/scores/american_football", (req,res)=>serveSingle(req,res,"american_football", L.NFL, seasonCandidatesNFL()));
-app.get("/scores/basketball",        (req,res)=>serveSingle(req,res,"basketball",        L.NBA, seasonCandidatesDefault()));
+// Aliases (keep client compatibility)
+app.get("/scores/american_football", (req,res)=>serveSingle(req,res,"american_football", L.NFL, seasonsNFL()));
+app.get("/scores/basketball",        (req,res)=>serveSingle(req,res,"basketball",        L.NBA, seasonsDefault()));
 
 async function serveSingle(req,res,sport,leagueId,seasons){
   try{
-    const n=Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
-    const items=await getBoardCached(`OUT:${sport}:${leagueId}:v27:${n}`, () =>
-      buildSingle({ sport, leagueId, n, seasons })
+    const n = Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
+    const items = await getBoardCached(`OUT:${sport}:${leagueId}:v28:${n}`, () =>
+      buildSingle({ sport, leagueId, seasons, n })
     );
     res.json(items.map(formatMatch));
   }catch(e){ console.error(`${sport} error:`, e); res.status(500).json({error:"internal"}); }
