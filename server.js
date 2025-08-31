@@ -1,24 +1,22 @@
-// server.js — v32: EPL day-fill really fills (90d/40calls), strict dedupe counting,
-// stronger league matching on 'eventsday', season-rescue kept.
-
+// server.js — v33: EPL strict day-match + 120d/90calls dayfill
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ v32 (EPL day-fill 90d/40calls + strict dedupe + season rescue)";
+const BUILD = "SportsHQ v33 (EPL strict + 120d/90calls dayfill)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 if (typeof fetch !== "function") {
   global.fetch = (...args) => import("node-fetch").then(m => m.default(...args));
 }
 
-// ---------- ENV ----------
+// ===== ENV =====
 const V2_KEY = process.env.TSDB_V2_KEY || "";
 const V1_KEY = process.env.TSDB_V1_KEY || "";
 if (!V2_KEY) console.warn("ℹ️ TSDB_V2_KEY missing (live may be limited)");
 if (!V1_KEY) console.warn("ℹ️ TSDB_V1_KEY missing; using shared/test key");
 
-// ---------- CACHE / SWR ----------
+// ===== CACHE/SWR =====
 const DEFAULT_COUNT = 10;
 const TTL = { LIVE:15_000, NEXT:5*60_000, SEASON:2*60*60_000, PAST:10*60_000, DAY:30*60_000, OUT:90_000 };
 const SWR_EXTRA = 5*60_000;
@@ -35,7 +33,6 @@ async function withInflight(k,fn){ if(inflight.has(k)) return inflight.get(k);
 
 const COMMON_HEADERS = { "User-Agent":"SportsHQ/1.0 (+render.com)", "Accept":"application/json" };
 const sleep=ms=>new Promise(r=>setTimeout(r,ms)), jitter=ms=>ms+Math.floor(Math.random()*(ms/3));
-
 async function fetchJsonRetry(url, extra={}, tries=4, baseDelay=650){
   let lastErr;
   for (let i=0;i<tries;i++){
@@ -58,7 +55,7 @@ async function memoJson(url, ttl, extra={}) {
   return withInflight(key, fetcher);
 }
 
-// ---------- time / status ----------
+// ===== time/status helpers =====
 function pickScore(v){ return (v===undefined||v===null||v===""||v==="N/A")?null:v; }
 function isLiveWord(s=""){ s=(s+"").toLowerCase(); return s.includes("live")||s.includes("in play")||s.includes("half")||s==="ht"||s.includes("ot"); }
 function isFinalWord(s=""){ s=(s+"").toLowerCase(); return s.includes("final")||s==="ft"||s.includes("full time"); }
@@ -70,8 +67,8 @@ function normalizeStatus(m,s1,s2){
   return has ? raw : "Scheduled";
 }
 const FINAL_KEEP_MS=15*60*1000;
-function isRecentFinal(m){ const raw=m.strStatus||m.strProgress||""; if(!isFinalWord(raw)) return false; const t=eventMillis(m).ms; return Number.isFinite(t)&&(Date.now()-t)<=FINAL_KEEP_MS; }
 
+// robust time parsing
 function parseFlexibleDate(str){
   if (str==null) return NaN;
   if (typeof str!=="string"){ const n=Number(str); return Number.isFinite(n)?(n>1e12?n:n*1000):NaN; }
@@ -93,7 +90,7 @@ function eventMillis(m){
   let ms=parseFlexibleDate(m.strTimestampMS); if (Number.isFinite(ms)) return {ms,dateOnly:false,ymd:new Date(ms).toISOString().slice(0,10)};
   ms=parseFlexibleDate(m.strTimestamp);       if (Number.isFinite(ms)) return {ms,dateOnly:false,ymd:new Date(ms).toISOString().slice(0,10)};
   const tryCombo=(d,t)=>{
-    if (!d) return {ms:NaN,dateOnly:false,ymd:""};
+    if(!d) return {ms:NaN,dateOnly:false,ymd:""};
     const ds=String(d).trim(); const ymd=ds.slice(0,10);
     if (isTBA(t)){ const base=parseFlexibleDate(ds); return {ms:base,dateOnly:true,ymd}; }
     const tt=String(t).trim().replace(/([+\-]\d{2})(\d{2})$/,"$1:$2");
@@ -113,10 +110,10 @@ function futureOK(ev, nowMs){
   if (dateOnly){ const today=new Date(nowMs).toISOString().slice(0,10); return ymd>=today; }
   return false;
 }
-
+function isRecentFinal(m){ const raw=m.strStatus||m.strProgress||""; if(!isFinalWord(raw)) return false; const t=eventMillis(m).ms; return Number.isFinite(t)&&(Date.now()-t)<=FINAL_KEEP_MS; }
 function computedStatus(m){ const s1=pickScore(m.intHomeScore??m.intHomeGoals), s2=pickScore(m.intAwayScore??m.intAwayGoals); return normalizeStatus(m,s1,s2); }
 
-// dedupe that reports if added
+// dedupe (return true if added)
 function pushUnique(arr,m){
   const k = m.idEvent || `${m.strHomeTeam}|${m.strAwayTeam}|${m.dateEvent||m.dateEventLocal||""}`;
   if (arr.some(x => (x.idEvent || `${x.strHomeTeam}|${x.strAwayTeam}|${x.dateEvent||x.dateEventLocal||""}`) === k)) return false;
@@ -132,7 +129,7 @@ function sortForDisplay(a,b){
   if (sa==="Final") return tb-ta; return ta-tb;
 }
 
-// ---------- TSDB wrappers ----------
+// ===== TSDB wrappers =====
 async function v2Livescore(sport){
   const s=sport.replace(/_/g," ");
   const urls=[
@@ -149,16 +146,17 @@ async function v1PastLeague(id){ const j=await memoJson(V1(`eventspastleague.php
 const SPORT_LABEL={ soccer:"Soccer", basketball:"Basketball", american_football:"American Football", ice_hockey:"Ice Hockey" };
 async function v1EventsDay(sport, ymd){ const label=SPORT_LABEL[sport]||sport; const j=await memoJson(V1(`eventsday.php?d=${ymd}&s=${encodeURIComponent(label)}`), TTL.DAY); return Array.isArray(j?.events)?j.events:[]; }
 
-// ---------- seasons & leagues ----------
+// ===== seasons/leagues =====
 function guessSeasonCrossYear(){ const d=new Date(), y=d.getUTCFullYear(), m=d.getUTCMonth()+1; const start=(m>=7)?y:y-1; return `${start}-${start+1}`; }
 function nextCross(s){ const a=parseInt(s.split("-")[0],10); return `${a+1}-${a+2}`; }
 function prevCross(s){ const a=parseInt(s.split("-")[0],10); return `${a-1}-${a}`; }
 function seasonsSoccer(){ const c=guessSeasonCrossYear(), y=(new Date()).getUTCFullYear(); return [c,nextCross(c),prevCross(c),String(y),String(y+1),String(y-1)]; }
 function seasonsNFL(){ const y=(new Date()).getUTCFullYear(), c=guessSeasonCrossYear(); return [String(y),String(y+1),String(y-1),c,nextCross(c),prevCross(c)]; }
 function seasonsDefault(){ const c=guessSeasonCrossYear(); return [c,nextCross(c),prevCross(c)]; }
+
 const L = { EPL:4328, NBA:4387, NFL:4391, NHL:4380 };
 
-// ---------- format ----------
+// ===== format =====
 function formatMatch(m){
   const home=m.strHomeTeam||m.homeTeam||m.strHome||"", away=m.strAwayTeam||m.awayTeam||m.strAway||"";
   const s1=pickScore(m.intHomeScore??m.intHomeGoals), s2=pickScore(m.intAwayScore??m.intAwayGoals);
@@ -167,7 +165,7 @@ function formatMatch(m){
            headline:`${home} vs ${away} - ${status}`, start:Number.isFinite(ms)?new Date(ms).toISOString():null };
 }
 
-// ---------- season rescue ----------
+// ===== season rescue =====
 function rescueSeasonFuture(rows, nowMs){
   if (!Array.isArray(rows)||rows.length===0) return [];
   const today=new Date(nowMs).toISOString().slice(0,10);
@@ -184,32 +182,26 @@ function rescueSeasonFuture(rows, nowMs){
   return out;
 }
 
-// ---------- better 'day' league matcher ----------
-function leagueMatchDay(m, leagueId, sport){
-  const idOk = String(m.idLeague||"") === String(leagueId);
-  if (idOk) return true;
-  const names = [
-    String(m.strLeague||""),
-    String(m.strLeagueAlternate||""),
-    String(m.strLeagueES||""),
-    String(m.strLeagueFR||""),
-    String(m.strLeagueDE||""),
-  ].join("|").toLowerCase();
+// ===== EPL day-match (strict) =====
+function leagueMatchDayStrictEPL(m, leagueId){
+  const idStr = String(m.idLeague||"");
+  if (idStr) return idStr === String(leagueId);        // require exact ID if present
 
-  if (sport==="soccer"){
-    // Accept English Premier League, but exclude PL2/cups/shields.
-    if (names.includes("premier league") && !names.includes("2") && !names.includes("cup") && !names.includes("shield")) return true;
-    return false;
-  }
-  if (sport==="american_football"){
-    if (names.includes("nfl") || names.includes("national football league")) return true;
-    return false;
-  }
-  return idOk;
+  // fall back only when idLeague missing
+  const blob = [
+    m.strLeague, m.strLeagueAlternate, m.strLeagueES, m.strLeagueFR, m.strLeagueDE
+  ].filter(Boolean).join(" | ").toLowerCase();
+
+  const hasEnglish = blob.includes("english");
+  const hasPremier = blob.includes("premier league");
+  const bad = blob.includes(" 2") || blob.includes(" 2 ") || blob.includes("premier league 2")
+           || blob.includes("cup") || blob.includes("shield") || blob.includes("trophy")
+           || blob.includes("series") || blob.includes("friendly");
+  return hasEnglish && hasPremier && !bad;
 }
 
-// ---------- day fill (wider window, strict count) ----------
-async function dayFill({ sport, leagueId, out, need, maxDays=90, maxCalls=40 }){
+// ===== day fill (120d / 90 calls) =====
+async function dayFill({ sport, leagueId, out, need, maxDays=120, maxCalls=90 }){
   const now=Date.now(), today=new Date();
   let calls=0, added=0;
   for (let d=0; d<=maxDays && added<need; d++){
@@ -217,8 +209,8 @@ async function dayFill({ sport, leagueId, out, need, maxDays=90, maxCalls=40 }){
     const ymd=new Date(today.getTime()+d*86400000).toISOString().slice(0,10);
     const rows=await v1EventsDay(sport, ymd); calls++;
     const fut=(rows||[])
-      .filter(m=>leagueMatchDay(m, leagueId, sport))
-      .filter(m=>futureOK(m, now))
+      .filter(m => leagueMatchDayStrictEPL(m, leagueId))
+      .filter(m => futureOK(m, now))
       .sort((a,b)=>eventMillis(a).ms - eventMillis(b).ms);
     for (const m of fut){
       if (added>=need) break;
@@ -228,10 +220,10 @@ async function dayFill({ sport, leagueId, out, need, maxDays=90, maxCalls=40 }){
   console.log(`[dayfill ${sport}:${leagueId}] +${added}/${need} (days<=${Math.min(maxDays,calls)})`);
 }
 
-// ---------- builder ----------
+// ===== builder =====
+function isRecentFinal(m){ const raw=m.strStatus||m.strProgress||""; if(!isFinalWord(raw)) return false; const t=eventMillis(m).ms; return Number.isFinite(t)&&(Date.now()-t)<=FINAL_KEEP_MS; }
 async function buildSingle({ sport, leagueId, seasons, n }){
-  const now=Date.now();
-  const finals=[], live=[], sched=[];
+  const now=Date.now(); const finals=[], live=[], sched=[];
 
   const past=await v1PastLeague(leagueId);
   for (const m of (past||[])) if (isRecentFinal(m)) pushUnique(finals, m);
@@ -264,15 +256,15 @@ async function buildSingle({ sport, leagueId, seasons, n }){
 
   const have=finals.length+live.length+sched.length;
   if (have<n){
-    await dayFill({ sport, leagueId, out:sched, need:n-have, maxDays:90, maxCalls:40 });
+    await dayFill({ sport, leagueId, out:sched, need:n-have, maxDays:120, maxCalls:90 });
   }
 
-  const out=[...finals, ...live, ...sched].sort(sortForDisplay).slice(0, n);
+  const out=[...finals, ...live, ...sched].sort(sortForDisplay).slice(0,n);
   console.log(`[debug ${sport}:${leagueId}] F=${finals.length} L=${live.length} nextFut=${nextFut.length} seasonRaw=${seasonRaw} seasonFut=${seasonFut} -> out=${out.length}`);
   return out;
 }
 
-// ---------- cache wrapper ----------
+// ===== cache wrapper =====
 async function getBoardCached(key, builder){
   const c=getCache(key); if (c.hit && c.fresh) return c.val;
   const fetcher=async()=>{ const data=await builder(); const full=Array.isArray(data)&&data.length>=DEFAULT_COUNT; setCache(key,data, full?TTL.OUT:8_000); return data; };
@@ -280,13 +272,13 @@ async function getBoardCached(key, builder){
   return withInflight(key, fetcher);
 }
 
-// ---------- routes ----------
+// ===== routes =====
 const LIDS = { EPL:4328, NBA:4387, NFL:4391, NHL:4380 };
 
 app.get("/scores/soccer", async (req,res)=>{
   try{
     const n=Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
-    const items=await getBoardCached(`OUT:soccer_epl_v32:${n}`, () =>
+    const items=await getBoardCached(`OUT:soccer_epl_v33:${n}`, () =>
       buildSingle({ sport:"soccer", leagueId:LIDS.EPL, seasons:seasonsSoccer(), n })
     );
     res.json(items.map(formatMatch));
@@ -295,14 +287,13 @@ app.get("/scores/soccer", async (req,res)=>{
 app.get("/scores/nfl", async (req,res)=>serveSingle(req,res,"american_football", LIDS.NFL, seasonsNFL()));
 app.get("/scores/nba", async (req,res)=>serveSingle(req,res,"basketball",        LIDS.NBA, seasonsDefault()));
 app.get("/scores/nhl", async (req,res)=>serveSingle(req,res,"ice_hockey",        LIDS.NHL, seasonsDefault()));
-// legacy aliases
 app.get("/scores/american_football", (req,res)=>serveSingle(req,res,"american_football", LIDS.NFL, seasonsNFL()));
 app.get("/scores/basketball",        (req,res)=>serveSingle(req,res,"basketball",        LIDS.NBA, seasonsDefault()));
 
 async function serveSingle(req,res,sport,leagueId,seasons){
   try{
     const n=Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
-    const items=await getBoardCached(`OUT:${sport}:${leagueId}:v32:${n}`, () =>
+    const items=await getBoardCached(`OUT:${sport}:${leagueId}:v33:${n}`, () =>
       buildSingle({ sport, leagueId, seasons, n })
     );
     res.json(items.map(formatMatch));
