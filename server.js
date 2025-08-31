@@ -1,9 +1,10 @@
-// server.js — v33: EPL strict day-match + 120d/90calls dayfill
+// server.js — v34: EPL day-match = (id=4328) OR (country=England & name has 'Premier League'),
+// excludes PL2/cups/shields/trophies/friendlies. Extra dayfill logs. 120d/90 calls.
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ v33 (EPL strict + 120d/90calls dayfill)";
+const BUILD = "SportsHQ v34 (EPL strict+country fallback, richer day logs)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 if (typeof fetch !== "function") {
@@ -16,7 +17,7 @@ const V1_KEY = process.env.TSDB_V1_KEY || "";
 if (!V2_KEY) console.warn("ℹ️ TSDB_V2_KEY missing (live may be limited)");
 if (!V1_KEY) console.warn("ℹ️ TSDB_V1_KEY missing; using shared/test key");
 
-// ===== CACHE/SWR =====
+// ===== CACHE / SWR =====
 const DEFAULT_COUNT = 10;
 const TTL = { LIVE:15_000, NEXT:5*60_000, SEASON:2*60*60_000, PAST:10*60_000, DAY:30*60_000, OUT:90_000 };
 const SWR_EXTRA = 5*60_000;
@@ -68,7 +69,6 @@ function normalizeStatus(m,s1,s2){
 }
 const FINAL_KEEP_MS=15*60*1000;
 
-// robust time parsing
 function parseFlexibleDate(str){
   if (str==null) return NaN;
   if (typeof str!=="string"){ const n=Number(str); return Number.isFinite(n)?(n>1e12?n:n*1000):NaN; }
@@ -82,7 +82,7 @@ function parseFlexibleDate(str){
   }
   const direct=Date.parse(s); if (Number.isFinite(direct)) return direct;
   const m=s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (m){ const Y=+m[1], M=+m[2]-1, D=+m[3]; return Date.UTC(Y,M,D,12,0,0); }
+  if (m){ const Y=+m[1], M=+m[2]-1, D=+m[3]; return Date.UTC(Y,M-1,D,12,0,0); }
   return NaN;
 }
 function isTBA(t){ if(!t) return true; const s=String(t).trim().toLowerCase(); return !s||s==="tba"||s==="tbd"||s==="ns"||s.startsWith("00:00:00"); }
@@ -113,7 +113,7 @@ function futureOK(ev, nowMs){
 function isRecentFinal(m){ const raw=m.strStatus||m.strProgress||""; if(!isFinalWord(raw)) return false; const t=eventMillis(m).ms; return Number.isFinite(t)&&(Date.now()-t)<=FINAL_KEEP_MS; }
 function computedStatus(m){ const s1=pickScore(m.intHomeScore??m.intHomeGoals), s2=pickScore(m.intAwayScore??m.intAwayGoals); return normalizeStatus(m,s1,s2); }
 
-// dedupe (return true if added)
+// dedupe returns true if added
 function pushUnique(arr,m){
   const k = m.idEvent || `${m.strHomeTeam}|${m.strAwayTeam}|${m.dateEvent||m.dateEventLocal||""}`;
   if (arr.some(x => (x.idEvent || `${x.strHomeTeam}|${x.strAwayTeam}|${x.dateEvent||x.dateEventLocal||""}`) === k)) return false;
@@ -153,7 +153,6 @@ function prevCross(s){ const a=parseInt(s.split("-")[0],10); return `${a-1}-${a}
 function seasonsSoccer(){ const c=guessSeasonCrossYear(), y=(new Date()).getUTCFullYear(); return [c,nextCross(c),prevCross(c),String(y),String(y+1),String(y-1)]; }
 function seasonsNFL(){ const y=(new Date()).getUTCFullYear(), c=guessSeasonCrossYear(); return [String(y),String(y+1),String(y-1),c,nextCross(c),prevCross(c)]; }
 function seasonsDefault(){ const c=guessSeasonCrossYear(); return [c,nextCross(c),prevCross(c)]; }
-
 const L = { EPL:4328, NBA:4387, NFL:4391, NHL:4380 };
 
 // ===== format =====
@@ -182,46 +181,48 @@ function rescueSeasonFuture(rows, nowMs){
   return out;
 }
 
-// ===== EPL day-match (strict) =====
-function leagueMatchDayStrictEPL(m, leagueId){
+// ===== EPL day-match (ID strict; country+name fallback) =====
+function eplDayMatch(m, leagueId){
   const idStr = String(m.idLeague||"");
-  if (idStr) return idStr === String(leagueId);        // require exact ID if present
+  if (idStr) return idStr === String(leagueId); // exact ID wins
 
-  // fall back only when idLeague missing
-  const blob = [
+  // Fallback only if idLeague missing/0
+  const leagueBlob = [
     m.strLeague, m.strLeagueAlternate, m.strLeagueES, m.strLeagueFR, m.strLeagueDE
   ].filter(Boolean).join(" | ").toLowerCase();
+  const country = String(m.strCountry||"").toLowerCase();
 
-  const hasEnglish = blob.includes("english");
-  const hasPremier = blob.includes("premier league");
-  const bad = blob.includes(" 2") || blob.includes(" 2 ") || blob.includes("premier league 2")
-           || blob.includes("cup") || blob.includes("shield") || blob.includes("trophy")
-           || blob.includes("series") || blob.includes("friendly");
-  return hasEnglish && hasPremier && !bad;
+  const hasPL   = leagueBlob.includes("premier league");
+  const england = country.includes("england") || leagueBlob.includes("english");
+  const bad = leagueBlob.includes("premier league 2") || leagueBlob.includes(" pl2")
+           || leagueBlob.includes("cup") || leagueBlob.includes("shield")
+           || leagueBlob.includes("trophy") || leagueBlob.includes("series")
+           || leagueBlob.includes("friendly");
+  return hasPL && england && !bad;
 }
 
-// ===== day fill (120d / 90 calls) =====
+// ===== day fill (120d/90 calls) with richer logs =====
 async function dayFill({ sport, leagueId, out, need, maxDays=120, maxCalls=90 }){
   const now=Date.now(), today=new Date();
-  let calls=0, added=0;
+  let calls=0, added=0, rawSeen=0, eplCand=0;
   for (let d=0; d<=maxDays && added<need; d++){
     if (calls>=maxCalls) break;
     const ymd=new Date(today.getTime()+d*86400000).toISOString().slice(0,10);
     const rows=await v1EventsDay(sport, ymd); calls++;
+    rawSeen += (rows?.length||0);
     const fut=(rows||[])
-      .filter(m => leagueMatchDayStrictEPL(m, leagueId))
-      .filter(m => futureOK(m, now))
+      .filter(m => eplDayMatch(m, leagueId))
+      .filter(m => { const ok=futureOK(m, now); if (ok) eplCand++; return ok; })
       .sort((a,b)=>eventMillis(a).ms - eventMillis(b).ms);
     for (const m of fut){
       if (added>=need) break;
       if (pushUnique(out, m)) added++;
     }
   }
-  console.log(`[dayfill ${sport}:${leagueId}] +${added}/${need} (days<=${Math.min(maxDays,calls)})`);
+  console.log(`[dayfill ${sport}:${leagueId}] raw=${rawSeen} eplOK=${eplCand} added=${added}/${need} (calls=${calls} days<=${Math.min(maxDays,calls)})`);
 }
 
 // ===== builder =====
-function isRecentFinal(m){ const raw=m.strStatus||m.strProgress||""; if(!isFinalWord(raw)) return false; const t=eventMillis(m).ms; return Number.isFinite(t)&&(Date.now()-t)<=FINAL_KEEP_MS; }
 async function buildSingle({ sport, leagueId, seasons, n }){
   const now=Date.now(); const finals=[], live=[], sched=[];
 
@@ -278,7 +279,7 @@ const LIDS = { EPL:4328, NBA:4387, NFL:4391, NHL:4380 };
 app.get("/scores/soccer", async (req,res)=>{
   try{
     const n=Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
-    const items=await getBoardCached(`OUT:soccer_epl_v33:${n}`, () =>
+    const items=await getBoardCached(`OUT:soccer_epl_v34:${n}`, () =>
       buildSingle({ sport:"soccer", leagueId:LIDS.EPL, seasons:seasonsSoccer(), n })
     );
     res.json(items.map(formatMatch));
@@ -293,7 +294,7 @@ app.get("/scores/basketball",        (req,res)=>serveSingle(req,res,"basketball"
 async function serveSingle(req,res,sport,leagueId,seasons){
   try{
     const n=Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_COUNT,10)||DEFAULT_COUNT));
-    const items=await getBoardCached(`OUT:${sport}:${leagueId}:v33:${n}`, () =>
+    const items=await getBoardCached(`OUT:${sport}:${leagueId}:v34:${n}`, () =>
       buildSingle({ sport, leagueId, seasons, n })
     );
     res.json(items.map(formatMatch));
