@@ -1,11 +1,12 @@
-// server.js — Simple 3+1 + season backfill + strong SWR fallback
-// Order: Finals(≤15m) → Live → Scheduled (soonest). Always returns up to 10.
+// server.js — Simple 3+1 v2 + DEBUG route
+// Order: Finals(≤15m) → Live → Scheduled (soonest). Season backfill, strong SWR.
+// Debug route: /debug/:board  (soccer|nfl|nba|nhl) — reports upstream availability.
 
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ simple-3+1 v2 (season backfill + strong SWR)";
+const BUILD = "SportsHQ simple-3+1 v2 + debug";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 // fetch polyfill for Node < 18
@@ -32,12 +33,12 @@ const DAILY_DOW   = [0,1,2,3,4,5,6];
 const DAILY_WEEKS = 3;
 
 const TTL = {
-  LIVE:   15_000,     // livescore refresh
-  NEXT:    5*60_000,  // next-league
-  PAST:   10*60_000,  // recent finals
-  DAY:    30*60_000,  // eventsday
+  LIVE:   15_000,       // livescore refresh
+  NEXT:    5*60_000,    // next-league
+  PAST:   10*60_000,    // recent finals
+  DAY:    30*60_000,    // eventsday
   SEASON:  6*60*60_000, // eventsseason (very long)
-  OUT:     90_000     // final board response TTL
+  OUT:     90_000       // final board response TTL
 };
 const SWR_EXTRA = 5 * 60_000;
 
@@ -207,12 +208,11 @@ function sweepDates(weeks, dows){
   return Array.from(out).sort();
 }
 
-/* ---------- season helpers (single call, long TTL) ---------- */
+/* ---------- season helpers ---------- */
 function crossYearNow(){ const d=new Date(), y=d.getUTCFullYear(), m=d.getUTCMonth()+1; const start=(m>=7)?y:y-1; return `${start}-${start+1}`; }
 function seasonCandidates(sport, leagueId){
   const y=(new Date()).getUTCFullYear(), cross=crossYearNow();
-  // NFL is single-year; others mostly cross-year
-  if (leagueId===L.NFL) return [String(y), String(y+1), cross];
+  if (leagueId===L.NFL) return [String(y), String(y+1), String(y-1)];
   return [cross, `${y}-${y+1}`, `${y-1}-${y}`];
 }
 async function seasonBackfill({ sport, leagueId, out, n }){
@@ -308,7 +308,7 @@ function fmt(m){
            headline:`${home} vs ${away} - ${status}`, start:Number.isFinite(ms)?new Date(ms).toISOString():null };
 }
 
-/* ---------- routes ---------- */
+/* ---------- routes (UNCHANGED logic) ---------- */
 // Soccer = EPL only
 app.get("/scores/soccer", async (req,res)=>{
   const n = Math.max(5, Math.min(10, parseInt(req.query.n||DEFAULT_N,10)||DEFAULT_N));
@@ -353,5 +353,69 @@ app.get("/scores/nhl", async (req,res)=>{
   res.json(rows.map(fmt));
 });
 
+/* ---------- PT1: DEBUG route (NEW) ---------- */
+app.get("/debug/:board", async (req, res) => {
+  try {
+    const name = String(req.params.board || "").toLowerCase();
+    const map = {
+      soccer: { sport: "soccer",            leagueId: L.EPL, label: "Soccer",            dow: EPL_DOW, weeks: EPL_WEEKS },
+      nfl:    { sport: "american_football", leagueId: L.NFL, label: "American Football", dow: NFL_DOW, weeks: NFL_WEEKS },
+      nba:    { sport: "basketball",        leagueId: L.NBA, label: "Basketball",        dow: DAILY_DOW, weeks: DAILY_WEEKS },
+      nhl:    { sport: "ice_hockey",        leagueId: L.NHL, label: "Ice Hockey",        dow: DAILY_DOW, weeks: DAILY_WEEKS },
+    };
+    const cfg = map[name];
+    if (!cfg) return res.status(400).json({ error: "unknown board" });
+
+    const now = Date.now();
+    const past = await v1PastLeague(cfg.leagueId);
+    const finalsRecent = (past||[]).filter(isRecentFinal);
+
+    const liveAll = await v2Livescore(cfg.sport);
+    const liveThis = (liveAll||[]).filter(m => String(m.idLeague||"") === String(cfg.leagueId));
+
+    const next = await v1NextLeague(cfg.leagueId);
+    const nextFuture = (next||[]).filter(m => futureOK(m, now));
+
+    const dates = sweepDates(cfg.weeks, cfg.dow);
+    let dayCalls = 0, dayRaw = 0, dayKept = 0;
+    for (const ymd of dates){
+      const rows = await v1EventsDay(cfg.sport, ymd); dayCalls++; dayRaw += (rows?.length||0);
+      const kept = (rows||[]).filter(m => String(m.idLeague||"")===String(cfg.leagueId))
+                             .filter(m => futureOK(m, now));
+      dayKept += kept.length;
+    }
+
+    let seasonRaw = 0, seasonFuture = 0;
+    for (const s of seasonCandidates(cfg.sport, cfg.leagueId)){
+      const rows = await v1Season(cfg.leagueId, s); seasonRaw += (rows?.length||0);
+      seasonFuture += (rows||[]).filter(m => futureOK(m, now)).length;
+    }
+
+    res.json({
+      board: name,
+      leagueId: cfg.leagueId,
+      counts: {
+        past_all: (past||[]).length,
+        finals_recent: finalsRecent.length,
+        live_allSports: (liveAll||[]).length,
+        live_thisLeague: liveThis.length,
+        next_all: (next||[]).length,
+        next_future: nextFuture.length,
+        day_calls: dayCalls,
+        day_raw: dayRaw,
+        day_kept_future: dayKept,
+        season_raw: seasonRaw,
+        season_future: seasonFuture,
+      },
+      notes: "Reports upstream availability only — does not build the board."
+    });
+  } catch (e) {
+    console.error("DEBUG route error:", e);
+    res.status(500).json({ error: "debug-failed" });
+  }
+});
+
+/* ---------- health ---------- */
 app.get("/health",(_,res)=>res.json({ok:true}));
 app.listen(PORT, ()=>console.log(`Server listening on ${PORT} — ${BUILD}`));
+
