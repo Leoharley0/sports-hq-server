@@ -1,11 +1,12 @@
-// server.js — v18: MLB+NBA+NFL+NHL guaranteed 10 rows (Finals→Live→Scheduled)
-// Low-load with SWR caching + retry, no dependency on v2 live to fill lists.
+// server.js — v19: Strict status gating + deterministic ordering.
+// Priority: Finals(≤15m) → Live → Scheduled
+// Live sorted by soonest-to-finish (start + expectedDuration), Scheduled by soonest-to-start.
 
 const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const BUILD = "SportsHQ v18 (4-leagues, guaranteed 10 rows, SWR cache)";
+const BUILD = "SportsHQ v19 (strict status + stable ordering)";
 app.get("/version", (_, res) => res.json({ build: BUILD }));
 
 // Polyfill fetch for Node < 18
@@ -13,40 +14,47 @@ if (typeof fetch !== "function") {
   global.fetch = (...args) => import("node-fetch").then(m => m.default(...args));
 }
 
-// ====== ENV / KEYS ==========================================================
-const V2_KEY = process.env.TSDB_V2_KEY || "";             // optional
-const V1_KEY = process.env.TSDB_V1_KEY || "3";            // always usable fallback
+// ===== ENV KEYS =====
+const V2_KEY = process.env.TSDB_V2_KEY || ""; // v2 livescore header
+const V1_KEY = process.env.TSDB_V1_KEY || ""; // v1 path key (falls back to public "3")
+if (!V2_KEY) console.warn("ℹ️ TSDB_V2_KEY missing (live may be limited)");
+if (!V1_KEY) console.warn("ℹ️ TSDB_V1_KEY missing; using shared/test key");
 
-// ====== CONSTANTS / TTLs ====================================================
-const DEFAULT_COUNT = 10;
-
+// ===== CONFIG =====
+const DEFAULT_COUNT = 10;               // rows per board
 const TTL = {
-  LIVE:   15_000,         // v2 livescore
-  NEXT:    5 * 60_000,    // v1 next
-  SEASON:  3 * 60 * 60_000,// v1 season
-  DAY:    30 * 60_000,    // v1 day
-  PAST:   10 * 60_000,    // v1 past (recent finals)
-  OUT:     60_000,        // built board
+  LIVE:   15_000,
+  NEXT:   5 * 60_000,
+  SEASON: 6 * 60 * 60_000,
+  DAY:    30 * 60_000,
+  PAST:   10 * 60_000,
+  OUT:    60_000,
 };
 const SWR_EXTRA = 5 * 60_000;
+const FINAL_KEEP_MS = 15 * 60 * 1000;
 
-// throttle for day scan (keeps warm after first fill)
-let DAY_TOKENS = 120;
-setInterval(() => { DAY_TOKENS = Math.min(120, DAY_TOKENS + 6); }, 10_000);
+// Expected durations (very rough, but enough to sort live games “closest to finish”)
+const SPORT_EXPECTED_MIN = {
+  basketball:        135,  // NBA ~2.25h
+  ice_hockey:        150,  // NHL ~2.5h
+  american_football: 195,  // NFL ~3.25h
+  baseball:          210,  // MLB highly variable; use 3.5h
+};
 
-// ====== CACHES ==============================================================
+// ===== Cache + in-flight dedupe =====
 const COMMON_HEADERS = { "User-Agent":"SportsHQ/1.0 (+render.com)", "Accept":"application/json" };
-const cache = new Map();    // key -> {val, exp, swr}
+const cache    = new Map(); // key -> {val,exp,swr}
 const inflight = new Map(); // key -> Promise
 
 function getCache(key){
-  const e = cache.get(key); if (!e) return {hit:false};
+  const e = cache.get(key);
+  if (!e) return {hit:false};
   const now = Date.now();
   if (now <= e.exp) return {hit:true, fresh:true,  val:e.val};
   if (now <= e.swr) return {hit:true, fresh:false, val:e.val};
   return {hit:false};
 }
-function setCache(key, val, ttl){
+function setCache(key,val,ttl){
   const now = Date.now();
   cache.set(key, { val, exp: now + ttl, swr: now + ttl + SWR_EXTRA });
 }
@@ -56,10 +64,11 @@ async function withInflight(key, fn){
   inflight.set(key,p); return p;
 }
 
+// ===== robust fetch with 429 backoff =====
 const sleep  = ms => new Promise(r => setTimeout(r, ms));
-const jitter = ms => ms + Math.floor(Math.random()*(ms/3));
+const jitter = ms => ms + Math.floor(Math.random() * (ms/3));
 
-async function fetchJsonRetry(url, extra={}, tries=4, baseDelay=700){
+async function fetchJsonRetry(url, extra={}, tries=4, baseDelay=650){
   let lastErr;
   for (let i=0;i<tries;i++){
     try{
@@ -87,196 +96,136 @@ async function memoJson(url, ttl, extra={}){
   const key = `URL:${url}`;
   const c = getCache(key);
   if (c.hit && c.fresh) return c.val;
-
-  const fetcher = async ()=>{
-    const j = await fetchJsonRetry(url, extra);
-    if (j) setCache(key, j, ttl);
-    return j || c.val || null;
-  };
+  const fetcher = async ()=>{ const j = await fetchJsonRetry(url, extra); if (j) setCache(key,j,ttl); return j || c.val || null; };
   if (c.hit && !c.fresh){ withInflight(key, fetcher); return c.val; }
   return withInflight(key, fetcher);
 }
 
-// ====== TIME / STATUS HELPERS ==============================================
+// ===== time + status helpers =====
 function cleanTime(t){ if(!t) return "00:00:00"; const s=String(t).trim(); return (/^tba$|^tbd$/i.test(s))?"00:00:00":s; }
 function toMillis(d,t){ if(!d) return NaN; const tt=cleanTime(t); const hasTZ=/[zZ]$|[+\-]\d\d:?\d\d$/.test(tt); const ms=Date.parse(`${d}T${tt}${hasTZ?"":"Z"}`); return Number.isNaN(ms)?NaN:ms; }
 function eventMillis(m){
   let ms = toMillis(m.dateEvent, m.strTime); if (!Number.isNaN(ms)) return ms;
   ms = toMillis(m.dateEventLocal||m.dateEvent, m.strTimeLocal||m.strTime); if (!Number.isNaN(ms)) return ms;
   if (m.strTimestampMS){ const n=+m.strTimestampMS; if (!Number.isNaN(n)) return n; }
-  if (m.strTimestamp){ const n=+m.strTimestamp*1000; if (!Number.isNaN(n)) return n; }
-  if (m.dateEvent){ ms=toMillis(m.dateEvent,"00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
-  if (m.dateEventLocal){ ms=toMillis(m.dateEventLocal,"00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
+  if (m.strTimestamp){   const n=+m.strTimestamp*1000; if (!Number.isNaN(n)) return n; }
+  if (m.dateEvent){      ms = toMillis(m.dateEvent, "00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
+  if (m.dateEventLocal){ ms = toMillis(m.dateEventLocal, "00:00:00Z"); if (!Number.isNaN(ms)) return ms; }
   return NaN;
 }
 function pickScore(v){ return (v===undefined||v===null||v===""||v==="N/A")?null:v; }
-function isLiveWord(s=""){ s=(s+"").toLowerCase(); return s.includes("live")||s.includes("in play")||s.includes("half")||s.includes("inning")||s==="ht"||s.includes("ot"); }
-function isFinalWord(s=""){ s=(s+"").toLowerCase(); return s.includes("final")||s.includes("full time")||s==="ft"; }
-function normalizeStatus(m,s1,s2){
-  const raw=String(m.strStatus||m.strProgress||"").trim(), has=(s1!==null)||(s2!==null);
+function isLiveWord(s=""){ s=(s+"").toLowerCase(); return s.includes("live")||s.includes("in play")||s.includes("half")||s==="ht"||s.includes("ot")||/^q\d/.test(s)||s.includes("quarter")||s.includes("period"); }
+function isFinalWord(s=""){ s=(s+"").toLowerCase(); return s.includes("final")||s==="ft"||s.includes("full time")||s.includes("ended")||s.includes("finished"); }
+
+// **Strict** status gating
+function strongStatus(m, sport){
+  const now = Date.now();
+  const raw  = (m.strStatus || m.strProgress || "").trim();
+  const s1 = pickScore(m.intHomeScore ?? m.intHomeGoals);
+  const s2 = pickScore(m.intAwayScore ?? m.intAwayGoals);
+  const ms = eventMillis(m);
+
+  // If we know it finished, call it Final
+  if (isFinalWord(raw) || ((s1!==null || s2!==null) && isFinite(ms) && now - ms > 5*60*1000)) return "Final";
+
+  // If we know the game hasn't started yet, force Scheduled (even if upstream says "Live")
+  if (isFinite(ms) && ms > now + 60*1000) return "Scheduled";
+
+  // If we're within the start window, treat as LIVE only with a positive signal
+  if (isFinite(ms) && now >= ms - 60*1000) {
+    if (isLiveWord(raw) || s1!==null || s2!==null) return "LIVE";
+    return "Scheduled";
+  }
+
+  // Fallback: words (rare)
+  if (isLiveWord(raw))  return "LIVE";
   if (isFinalWord(raw)) return "Final";
-  if (isLiveWord(raw))  return has ? "LIVE" : "Scheduled";
-  if (!raw||raw==="NS"||raw.toLowerCase()==="scheduled"||raw.toLowerCase()==="preview") return "Scheduled";
-  return has ? raw : "Scheduled";
+  return "Scheduled";
 }
-const FINAL_KEEP_MS = 15*60*1000;
+
+function statusGroup(m, sport){
+  const st = strongStatus(m, sport);
+  return st === "Final" ? 0 : st === "LIVE" ? 1 : 2;
+}
+
+function liveETA(m, sport){
+  const ms = eventMillis(m);
+  const now = Date.now();
+  const durMin = SPORT_EXPECTED_MIN[sport] || 150;
+  if (!isFinite(ms)) return Number.POSITIVE_INFINITY;
+  return (ms + durMin*60*1000) - now; // smaller means closer to finish
+}
+
+function sortForDisplay(a,b, sport){
+  const ga = statusGroup(a, sport);
+  const gb = statusGroup(b, sport);
+  if (ga !== gb) return ga - gb; // Finals → Live → Scheduled
+
+  const ta = eventMillis(a);
+  const tb = eventMillis(b);
+
+  if (ga === 0) { // Finals: newest first
+    return (isFinite(tb)?tb:0) - (isFinite(ta)?ta:0);
+  }
+  if (ga === 1) { // Live: soonest to finish
+    return liveETA(a, sport) - liveETA(b, sport);
+  }
+  // Scheduled: earliest start first
+  return (isFinite(ta)?ta:Number.POSITIVE_INFINITY) - (isFinite(tb)?tb:Number.POSITIVE_INFINITY);
+}
+
 function isRecentFinal(m){
-  const raw=m.strStatus||m.strProgress||""; if (!isFinalWord(raw)) return false;
-  const ms=eventMillis(m); if (!isFinite(ms)) return false;
-  return (Date.now()-ms) <= FINAL_KEEP_MS;
-}
-function computedStatus(m){
-  const s1=pickScore(m.intHomeScore??m.intHomeGoals), s2=pickScore(m.intAwayScore??m.intAwayGoals);
-  return normalizeStatus(m,s1,s2);
-}
-function matchKey(m){ return m.idEvent || `${m.strHomeTeam}|${m.strAwayTeam}|${m.dateEvent||m.dateEventLocal||""}`; }
-function pushUnique(arr,m){ const k=matchKey(m); if(!arr.some(x=>matchKey(x)===k)) arr.push(m); }
-function sortForDisplay(a,b){
-  const rank = s => s==="Final"?0 : s==="LIVE"?1 : 2;
-  const sa=computedStatus(a), sb=computedStatus(b);
-  if (rank(sa)!==rank(sb)) return rank(sa)-rank(sb);
-  const ta=eventMillis(a), tb=eventMillis(b);
-  const aBad=!isFinite(ta), bBad=!isFinite(tb);
-  if (aBad && !bBad) return +1;
-  if (!aBad && bBad) return -1;
-  if (sa==="Final") return tb-ta; // newest finals
-  return ta-tb;                   // soonest first
+  const raw = m.strStatus || m.strProgress || "";
+  if (!isFinalWord(raw)) return false;
+  const ms = eventMillis(m); if (!isFinite(ms)) return false;
+  return (Date.now() - ms) <= FINAL_KEEP_MS;
 }
 
-// ====== UPSTREAM WRAPPERS (v1 + v2) ========================================
-const V1 = (p)=>`https://www.thesportsdb.com/api/v1/json/${V1_KEY}/${p}`;
-const SPORT_LABEL={ baseball:"Baseball", basketball:"Basketball", american_football:"American Football", ice_hockey:"Ice Hockey" };
-
-async function v1NextLeague(id){ const j=await memoJson(V1(`eventsnextleague.php?id=${id}`), TTL.NEXT); return Array.isArray(j?.events)?j.events:[]; }
-async function v1Season(id,s){ const j=await memoJson(V1(`eventsseason.php?id=${id}&s=${encodeURIComponent(s)}`), TTL.SEASON); return Array.isArray(j?.events)?j.events:[]; }
-async function v1PastLeague(id){ const j=await memoJson(V1(`eventspastleague.php?id=${id}`), TTL.PAST); return Array.isArray(j?.events)?j.events:[]; }
-async function v1EventsDay(sport, ymd){
-  const label=SPORT_LABEL[sport]||sport;
-  const j=await memoJson(V1(`eventsday.php?d=${ymd}&s=${encodeURIComponent(label)}`), TTL.DAY);
-  return Array.isArray(j?.events)?j.events:[]; }
-
-// Optional live (not required to fill)
+// ===== TSDB wrappers =====
 async function v2Livescore(sport){
   const s=sport.replace(/_/g," ");
   const urls=[
     `https://www.thesportsdb.com/api/v2/json/livescore/${encodeURIComponent(s)}`,
     `https://www.thesportsdb.com/api/v2/json/livescore.php?s=${encodeURIComponent(s)}`
   ];
-  const out=[]; for (const u of urls){
+  const out=[];
+  for (const u of urls){
     const j = await memoJson(u, TTL.LIVE, V2_KEY ? {"X-API-KEY":V2_KEY} : {});
     if (j?.livescore?.length) out.push(...j.livescore);
   }
   return out;
 }
+const V1 = (p)=>`https://www.thesportsdb.com/api/v1/json/${V1_KEY || "3"}/${p}`;
+async function v1NextLeague(id){ const j=await memoJson(V1(`eventsnextleague.php?id=${id}`), TTL.NEXT); return Array.isArray(j?.events)?j.events:[]; }
+async function v1Season(id,s){ const j=await memoJson(V1(`eventsseason.php?id=${id}&s=${encodeURIComponent(s)}`), TTL.SEASON); return Array.isArray(j?.events)?j.events:[]; }
+async function v1PastLeague(id){ const j=await memoJson(V1(`eventspastleague.php?id=${id}`), TTL.PAST); return Array.isArray(j?.events)?j.events:[]; }
+const SPORT_LABEL={ soccer:"Soccer", basketball:"Basketball", american_football:"American Football", ice_hockey:"Ice Hockey", baseball:"Baseball" };
+async function v1EventsDay(sport, ymd){
+  const label=SPORT_LABEL[sport]||sport;
+  const j=await memoJson(V1(`eventsday.php?d=${ymd}&s=${encodeURIComponent(label)}`), TTL.DAY);
+  return Array.isArray(j?.events)?j.events:[]; // not used for MLB in your setup, but left available
+}
 
-// ====== SEASON HELPERS ======================================================
+// ===== Seasons (same as before) =====
 function guessSeasonCrossYear(){ const d=new Date(), y=d.getUTCFullYear(), m=d.getUTCMonth()+1; const start=(m>=7)?y:y-1; return `${start}-${start+1}`; }
-function seasonsCrossTriple(){ const c=guessSeasonCrossYear(); return [c, `${parseInt(c)-1}-${parseInt(c)}`, `${parseInt(c)+1}-${parseInt(c)+2}`]; }
-function seasonsSingle2(){ const y=(new Date()).getUTCFullYear(); return [String(y), String(y+1)]; } // MLB/NFL useful single-year ids
+function seasonsCrossTriple(){ const c=guessSeasonCrossYear(); const prev=`${parseInt(c)-1}-${parseInt(c)}`; const next=`${parseInt(c)+1}-${parseInt(c)+2}`; return [c, next, prev]; }
+function seasonsNFL(){ const y=(new Date()).getUTCFullYear(); const c=guessSeasonCrossYear(); return [String(y), String(y+1), c, `${parseInt(c)-1}-${parseInt(c)}`]; }
 
-// ====== LEAGUE IDS ==========================================================
+// ===== leagues =====
 const L = {
-  MLB: 4424,              // Major League Baseball
   NBA: 4387,
   NFL: 4391,
   NHL: 4380,
+  MLB: 4424, // TheSportsDB MLB
 };
 
-// ====== BUILDERS ============================================================
-async function fillFromSeasons(out, leagueId, seasons, n){
-  const now=Date.now();
-  for (const s of seasons){
-    const rows=await v1Season(leagueId, s);
-    const fut=(rows||[]).filter(m=>{const ms=eventMillis(m);return isFinite(ms)&&ms>=now;})
-                        .sort((a,b)=>eventMillis(a)-eventMillis(b));
-    for (const m of fut){ if (out.length>=n) break; pushUnique(out,m); }
-    if (out.length>=n) break;
-  }
-}
-
-async function dayFill(sport, filterLeagueId, out, n, maxDays=28){
-  let short = n - out.length; if (short<=0) return;
-  if (DAY_TOKENS <= 0) return;
-
-  const today = new Date();
-  for (let d=0; d<maxDays && DAY_TOKENS>0 && out.length<n; d++){
-    const ymd = new Date(today.getTime()+d*86400000).toISOString().slice(0,10);
-    const rows = await v1EventsDay(sport, ymd); DAY_TOKENS--;
-    const now=Date.now();
-    const fut = (rows||[])
-      .filter(m => !filterLeagueId || String(m.idLeague||"")===String(filterLeagueId))
-      .filter(m => { const ms=eventMillis(m); return isFinite(ms)&&ms>=now; })
-      .sort((a,b)=>eventMillis(a)-eventMillis(b));
-    for (const m of fut){ if (out.length>=n) break; pushUnique(out,m); }
-  }
-}
-
-async function buildSingle({ sport, leagueId, seasons, n }){
-  const finals=[], live=[], sched=[];
-  const now = Date.now();
-
-  // Finals (≤15m)
-  const past = await v1PastLeague(leagueId);
-  for (const m of (past||[])) if (isRecentFinal(m)) pushUnique(finals, m);
-  finals.sort((a,b)=>eventMillis(b)-eventMillis(a));
-
-  // Live (optional)
-  const ls = await v2Livescore(sport);
-  for (const m of (ls||[])) if (String(m.idLeague||"")===String(leagueId) && !isRecentFinal(m)) pushUnique(live, m);
-
-  // Next (cheap)
-  const next = await v1NextLeague(leagueId);
-  next.sort((a,b)=>eventMillis(a)-eventMillis(b));
-  for (const m of next){ if (finals.length+live.length+sched.length>=n) break;
-    const ms=eventMillis(m); if (!isFinite(ms)||ms<now) continue; pushUnique(sched,m); }
-
-  // Season future
-  if (finals.length+live.length+sched.length < n){
-    await fillFromSeasons(sched, leagueId, seasons, n - (finals.length+live.length));
-  }
-
-  // Day scan as last resort
-  if (finals.length+live.length+sched.length < n){
-    await dayFill(sport, leagueId, sched, n - (finals.length+live.length), 35);
-  }
-
-  const merged = [...finals, ...live, ...sched].sort(sortForDisplay).slice(0, n);
-  return merged;
-}
-
-// ====== OUTPUT CACHE WRAPPER ===============================================
-async function getBoardCached(key, builder){
-  const c=getCache(key);
-  if (c.hit && c.fresh) return c.val;
-  const fetcher=async()=>{ const data=await builder(); setCache(key,data,TTL.OUT); return data; };
-  if (c.hit && !c.fresh){ withInflight(key, fetcher); return c.val; }
-  return withInflight(key, fetcher);
-}
-
-// ====== ROUTES ==============================================================
-// MLB replaces the previous soccer board
-app.get("/scores/baseball", async (req,res)=>serveSingle(req,res,"baseball",        L.MLB, seasonsSingle2()));
-app.get("/scores/nba",      async (req,res)=>serveSingle(req,res,"basketball",      L.NBA, seasonsCrossTriple()));
-app.get("/scores/nfl",      async (req,res)=>serveSingle(req,res,"american_football",L.NFL, seasonsSingle2()));
-app.get("/scores/nhl",      async (req,res)=>serveSingle(req,res,"ice_hockey",      L.NHL, seasonsCrossTriple()));
-
-async function serveSingle(req,res,sport,leagueId,seasons){
-  try{
-    const n = Math.max(5, Math.min(10, parseInt(req.query.n || DEFAULT_COUNT,10) || DEFAULT_COUNT));
-    const key = `OUT:${sport}:${leagueId}:${n}`;
-    const items = await getBoardCached(key, () => buildSingle({ sport, leagueId, seasons, n }));
-    console.log(`/${req.path.split("/").pop()} -> ${items.length} items (n=${n})`);
-    res.json(items.map(formatMatch));
-  }catch(e){ console.error(`${sport} error:`, e); res.status(500).json({error:"internal"}); }
-}
-
-// Format row for Roblox
-function formatMatch(m){
+// ===== formatting to client (keep same shape) =====
+function formatMatch(m, sport){
   const home=m.strHomeTeam||m.homeTeam||m.strHome||"";
   const away=m.strAwayTeam||m.awayTeam||m.strAway||"";
   const s1=pickScore(m.intHomeScore??m.intHomeGoals);
   const s2=pickScore(m.intAwayScore??m.intAwayGoals);
-  const status=normalizeStatus(m,s1,s2);
+  const status=strongStatus(m, sport);
   const ms=eventMillis(m);
   return {
     team1:home, team2:away,
@@ -287,25 +236,62 @@ function formatMatch(m){
   };
 }
 
-// Debug endpoints (optional)
-app.get("/_debug/:board", async (req,res)=>{
-  const b=req.params.board;
-  const map={ nba:[L.NBA,"basketball",seasonsCrossTriple()],
-              nfl:[L.NFL,"american_football",seasonsSingle2()],
-              nhl:[L.NHL,"ice_hockey",seasonsCrossTriple()],
-              baseball:[L.MLB,"baseball",seasonsSingle2()]};
-  const cfg = map[b]; if(!cfg) return res.status(400).json({error:"bad board"});
-  const [leagueId, sport, seasons] = cfg;
-  // just show what upstreams return counts-wise
-  const finals = (await v1PastLeague(leagueId))||[];
-  const live   = (await v2Livescore(sport))||[];
-  const next   = (await v1NextLeague(leagueId))||[];
-  res.json({ board:b, leagueId, counts:{
-    past_all: finals.length,
-    live_allSports: live.length,
-    next_all: next.length
-  }, note:"diagnostic counts only" });
-});
+// ===== board builders (unchanged sources; new gating & sorting apply) =====
+async function buildSingle({ sport, leagueId, seasons, n }){
+  const finals=[], live=[], sched=[];
+  const now = Date.now();
+
+  // Recent finals
+  const past = await v1PastLeague(leagueId);
+  for (const m of (past||[])) if (isRecentFinal(m)) finals.push(m);
+
+  // Live
+  const ls = await v2Livescore(sport);
+  for (const m of (ls||[])) if (String(m.idLeague||"")===String(leagueId) && strongStatus(m, sport)==="LIVE") live.push(m);
+
+  // Upcoming (cheap → richer)
+  const next = (await v1NextLeague(leagueId)).sort((a,b)=>eventMillis(a)-eventMillis(b));
+  for (const m of next){ if (sched.length + finals.length + live.length >= n) break; if (isFinite(eventMillis(m)) && eventMillis(m) >= now) sched.push(m); }
+
+  // Seasons (optional topup if still short)
+  if (finals.length + live.length + sched.length < n){
+    for (const s of seasons){
+      const rows = await v1Season(leagueId, s);
+      const fut  = (rows||[]).filter(x => isFinite(eventMillis(x)) && eventMillis(x)>=now)
+                             .sort((a,b)=>eventMillis(a)-eventMillis(b));
+      for (const m of fut){ if (finals.length + live.length + sched.length >= n) break; sched.push(m); }
+      if (finals.length + live.length + sched.length >= n) break;
+    }
+  }
+
+  const merged = [...finals, ...live, ...sched].sort((a,b)=>sortForDisplay(a,b,sport)).slice(0,n);
+  return merged;
+}
+
+// ===== cached wrappers =====
+async function getBoardCached(key, builder){
+  const c=getCache(key);
+  if (c.hit && c.fresh) return c.val;
+  const fetcher=async()=>{ const data=await builder(); setCache(key,data,TTL.OUT); return data; };
+  if (c.hit && !c.fresh){ withInflight(key, fetcher); return c.val; }
+  return withInflight(key, fetcher);
+}
+
+// ===== routes =====
+app.get("/scores/nba", async (req,res)=>serveSingle(req,res,"basketball",        L.NBA, seasonsCrossTriple()));
+app.get("/scores/nfl", async (req,res)=>serveSingle(req,res,"american_football", L.NFL, seasonsNFL()));
+app.get("/scores/nhl", async (req,res)=>serveSingle(req,res,"ice_hockey",        L.NHL, seasonsCrossTriple()));
+app.get("/scores/baseball", async (req,res)=>serveSingle(req,res,"baseball",     L.MLB, seasonsCrossTriple()));
+
+async function serveSingle(req,res,sport,leagueId,seasons){
+  try{
+    const n = Math.max(5, Math.min(10, parseInt(req.query.n || DEFAULT_COUNT,10) || DEFAULT_COUNT));
+    const items = await getBoardCached(`OUT:${sport}:${leagueId}:${n}`, () =>
+      buildSingle({ sport, leagueId, seasons, n })
+    );
+    res.json(items.map(m => formatMatch(m, sport)));
+  }catch(e){ console.error(`${sport} error:`, e); res.status(500).json({error:"internal"}); }
+}
 
 app.get("/health",(_,res)=>res.json({ok:true}));
 app.listen(PORT, ()=>console.log(`Server listening on ${PORT} — ${BUILD}`));
